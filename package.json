@@ -1,0 +1,25 @@
+{
+  "name": "elpp-decoder",
+  "version": "0.1.0",
+  "description": "Measurement{Earth} Low Power Protocol",
+  "main": "index.js",
+  "scripts": {
+    "test": "node decoder-test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/measurementearth/elpp-decoder.git"
+  },
+  "keywords": [
+    "lpp",
+    "lorawan",
+    "protocol",
+    "blockchain"
+  ],
+  "author": "Firmware Modules Inc.",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/measurementearth/elpp-decoder/issues"
+  },
+  "homepage": "https://github.com/measurementearth/elpp-decoder#readme"
+}
