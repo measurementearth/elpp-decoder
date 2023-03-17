@@ -23,7 +23,7 @@ SOFTWARE.
 /* Measurement{Earth} (Enhanced/Earth) Low Power Protocol (ELPP)
  * 
  * This protocol is designed to meet multiple objectives:
- *   - minimize payload sizes
+ *   - minimize payload sizes by supporting bitfields
  *   - transport agnostic (LoRaWAN, satellite, IP)
  *   - cloud platform agnostic
  *   - support for blockchain ABIs (in particular, Antelope, on which the Measurement{Earth} IoT platform is built)
@@ -37,11 +37,20 @@ SOFTWARE.
  *     classes available like 'Buffer'.
  *     
  *   - Type decoders consume input data in multiples of bits, but the the channel byte
- *     must exist on a byte boundary - effectively limiting each entire type to a multiple
- *     of bytes.  The type decoders are packed to fit mutiples of whole bytes.
+ *     must exist on a byte boundary.  The type decoders are packed to fit mutiples of whole bytes.
  *     
  *   - Decoders can be layered, i.e. decoders can reference other type decoders not
- *     just primitive decoder functions, effectively forming an 'ABI'.
+ *     just primitive decoder functions, effectively forming an 'ABI' made from subtypes.
+ *     
+ * How to use:
+ * 
+ *   1. Select a platform decoder (e.g. decoder_datacake.js) and copy and paste it into the
+ *      first half of your platform's 'payload decoder' section.
+ *   2. Copy and paste everything below this up until the ---- CUT ----- line into
+ *      the bottom half of your platforms 'payload decoder' section.
+ *   3. Embed a call to the 'decoder' function within the platform's 'payloader decoder' 
+ *      main function call, extracting the actual payload bytes as necessary 
+ *      and passing them to decoder(bytes, map, platform).
  */
 
 var DO_DEBUG = true
@@ -87,8 +96,9 @@ var RESULT_CHANNEL_NOT_FOUND = -3
 
 /*--- Primitive Decoders ----------------------------------------------------*/
 
-function check_len(buf, bit_index, bitn) {
-    return (buf.length << 3) >= (bit_index + bitn)
+/* Set on_boundary to 1 to enforce bit_index being on a byte boundary */
+function check_len(buf, bit_index, bitn, on_boundary) {
+    return (buf.length << 3) >= (bit_index + bitn) && (!on_boundary || (on_boundary && ((bit_index & 0x7) == 0)))
 }
 
 function capture_bits(buf, start_bit, end_bit) {
@@ -143,7 +153,7 @@ function capture_bits(buf, start_bit, end_bit) {
 function bitfield_decoder(buf, bit_index, out, args) {
     if (args) {
         var bitn = args.i_bits + args.f_bits
-        if (check_len(buf, bit_index, bitn)) {
+        if (check_len(buf, bit_index, bitn, 0)) {
             var value = capture_bits(buf, bit_index, bit_index + bitn - 1)
             if (args.sign) {
                 var shift = 32 - bitn
@@ -158,7 +168,39 @@ function bitfield_decoder(buf, bit_index, out, args) {
 }
 
 function varuint32_decoder(buf, bit_index, out) {
-    return 8
+    var val = 0
+    var bit = 0
+    var bit_count = 0
+    while (check_len(buf, bit_index, 8, 1)) {
+        var b = buf[bit_index >> 3]
+        val |= (b & 0x7f) << bit
+        bit += 7
+
+        bit_index += 8
+        bit_count += 8
+
+        if (!(b & 0x80)) {
+            break
+        }
+    }
+    out.push(val)
+    return bit_count
+}
+
+function varint32_decoder(buf, bit_index, out) {
+    var bit_count = varuint32_decoder(buf, bit_index, out)
+    if (bit_count > 0) {
+        var val = out[out.length - 1]
+        TRACE_D('varint32 in : ' + val)
+        if (val & 1) {
+            val = ((~val) >> 1) | 0x80000000
+        } else {
+            val >>>= 1
+        }
+        TRACE_D('varint32 out : ' + val)
+        out[out.length - 1] = val
+    }
+    return bit_count
 }
 
 /* Decode a 'name' from the byte-aligned 64-bits
@@ -167,8 +209,31 @@ function name_decoder(buf, bit_index, out) {
     return 8 * 8
 }
 
+function uint8_decoder(buf, bit_index, out) {
+    if (check_len(buf, bit_index, 8, 1)) {
+        out.push(buf[bit_index >> 3] & 0xff)
+        return 8
+    }
+    return -1
+}
+
+function uint32_decoder(buf, bit_index, out) {
+    if (check_len(buf, bit_index, 32, 1)) {
+        var index = bit_index >> 3
+        var word =
+            buf[index + 0] << 24 |
+            buf[index + 1] << 16 |
+            buf[index + 2] << 8 |
+            buf[index + 3] << 0
+        out.push(word & 0xffffffff)
+        return 32
+    }
+    return -1
+}
+
 
 /*--- Sensor type decoders ---------------------------------------------------*/
+/* temperature is stored in 16-bits s12q4 format. */
 var temp_decoder = [
     { fn: bitfield_decoder, args: { sign: 1, i_bits: 12, f_bits: 4 } },
 ]
@@ -183,115 +248,107 @@ var pm_decoder = [
     { fn: name_decoder }
 ]
 
+var accel_decoder = [
+    { fn : varint32_decoder, name: 'x' },
+    { fn : varint32_decoder, name: 'y' },
+    { fn : varint32_decoder, name: 'z' }
+]
 
-/* Decoder queue has to accept an array of decoders only */
-function elpp_decoder_queue_build(queue, decoder) {
-    TRACE('Decoder queue adding ' + decoder.length + ' field elements at depth ' + queue.length)
+
+/*--- System decoders ---------------------------------------------------*/
+
+var time_decoder = [
+    { fn: uint8_decoder, name: 'flags' },
+    { fn: uint32_decoder, name: 'epoch' }
+]
+
+
+/*--- Decoder Engine ---------------------------------------------------------*/
+
+
+/* Run the decoders to consume input bits */
+function decoder_run(buf, bit_index, out, decoder) {
+    var decoded_bits = 0
+    TRACE('Executing ' + decoder.length + ' decoders...')
     for (var i = 0; i < decoder.length; i++) {
-        /* add decoder if it is a primitive function, i.e. has no length field. */
         var field_decoder = decoder[i]
         if (field_decoder.length) {
-            /* dig deeper */
-            elpp_decoder_queue_build(queue, field_decoder)
+            /* follow the heirarchy */
+            var res = decoder_run(buf, bit_index + decoded_bits, out, field_decoder)
+            if (res < 0) {
+                return res
+            } else {
+                decoded_bits += res
+            }
         } else {
-            queue.push(field_decoder)
+            /* run decoder now */
+            if (field_decoder.fn) {                
+//                TRACE(field_decoder.fn.name + ' decoding at bit_index ' + (bit_index + decoded_bits) + ' ' + field_decoder.name)
+                TRACE('decoding ' + (field_decoder.name ? field_decoder.name : '') + ' with ' + field_decoder.fn.name + ' at bit_index ' + (bit_index + decoded_bits))
+                var res = field_decoder.fn(buf, bit_index + decoded_bits, out, field_decoder.args)
+                if (res < 0) {
+                    return res
+                } else {
+                    decoded_bits += res
+                }
+            }
         }
     }
+    return decoded_bits
 }
 
 
-/*--- Sensor type decoders ---------------------------------------------------*/
-
 /* Decoder engine
- *   Accepts array of bytes, a channel map and a platform object
+ * 
+ *   Accepts array of bytes, a channel map and a platform object.
  *   The output from each data type decoder is a naturalized data format,
- *   e.g. temperature bitfield decoder returns a float-point temperature.
+ *   e.g. temperature bitfield decoder returns a floating-point temperature value.
  *   This output is funneled into a cloud-platform-specific processing function.
- *   
- *  The decoder may need to return something that makes sense to the cloud platform it is embedded in.
+ *
+ *  The decoder will need to return something that makes sense to the cloud platform it is embedded in.
  *  In one example, the processors would build a list of cloud-specific data structures and this
- *  function is require to return it.  Procesors get an object to which they can add keys or add to keys,
- *  and finally the decoder return the post_processor output.
- *  
+ *  function is require to return it.  Procesors get an object to which they can add keys or add to keys
+ *  based on the the decoded data.
+ *
 */
 function decoder(bytes, map, platform) {
 
-    /* State for the decoder processor */
     var processor_data = {}
-    /* The current processor for the decoder channel */
-    var decoder_processor = null
-
-    if (platform) {
-        platform.pre_process(processor_data)
-    }
-
-    /* Use a bit-counter to process the data, but note that:
-     *   - within data type fields, bits are consumed
-     *   - data types as a whole consume a multiple of 8-bits (bytes).
-     */
-    var bit_index = 0
     var result = RESULT_OK
-    /* push decoder primitive objects onto this queue: { fn, args } */
-    var decoder_queue = []
-    if (bytes && map) { 
-        TRACE('Decoding ' + bytes.length + ' bytes')
-        var bit_count = bytes.length << 3
-        while (bit_index < bit_count && result >= 0) {
-            if (decoder_queue.length) {
-                /* If there are decoders in the queue, execute them all to consume bits. 
-                 * Decoder output is written to this array
-                 */
-                var decoder_out = []
-                TRACE('Executing ' + decoder_queue.length + ' decoders...')
-                for (var i = 0; i < decoder_queue.length; i++) {
-                    var decoder = decoder_queue[i]
-                    /* { fn, args } => fn(buf, bit_index, out, args)  */
-                    if (decoder.fn) {
-                        var decoder_bits = decoder.fn(bytes, bit_index, decoder_out, decoder.args)
-                        TRACE("Decoder " + decoder.fn.name + ' : bit_index ' + bit_index + ' consumed ' + decoder_bits)
-                        if (decoder_bits < 0) {
-                            ERROR('Decoder ' + decoder.fn.name + ' failed: ' + decoder_bits)
-                            result = decoder_bits
-                            break
-                        } else {
-                            bit_index += decoder_bits
-                        }
-                    }
-                }
-                /* reset decoder queue */
-                decoder_queue = []
+    var bit_index = 0
+    var bit_count = bytes.length << 3
 
-                /* Execute the processor on this decoder output */
-                if (decoder_processor) {
-                    decoder_processor(decoder_out, processor_data)
-                    decoder_processor = null
-                }
-                /* At the end of this, we must jump to the next byte boundary, if not there already. */
-                if (bit_index & 0x7) {
-                    TRACE('WARNING: non-byte-aligned after decoder at bit ' + bit_index)
-                    bit_index += 8
-                    bit_index &= ~(0x7)
-                }
+    platform.pre_process(processor_data)
+    TRACE('Decoding ' + bytes.length + ' bytes')
+
+    while (bit_index < bit_count && result >= 0) {
+        var chan = bytes[bit_index >> 3]
+        TRACE('Decode channel ' + chan + ' @ ' + bit_index)
+        bit_index += 8
+        if (chan in map) {
+            var decoder = map[chan]
+            var decoder_out = []
+            var res = decoder_run(bytes, bit_index, decoder_out, decoder.decoder)
+            if (res < 0) {
+                result = res
+                ERROR('decoding ' + res)
+                break
             } else {
-                /* If the stack is empty, we are in channel search mode */
-                /* Get the channel */
-                var chan = bytes[bit_index >> 3]
-                TRACE('Search for channel ' + chan + ' @ ' + bit_index)
-                if (chan in map) {
-                    /* Build the stack of decoder functions to execute */
-                    var channel_decoder = map[chan]
-                    /* A channel decoder has a decoder entry point and a decoder output processor. */
-                    elpp_decoder_queue_build(decoder_queue, channel_decoder.decoder)
-                    /* install the decoder processor */
-                    decoder_processor = channel_decoder.processor
-                    /* increment past the channel control byte */
-                    bit_index += 8
-                } else {
-                    ERROR('Unknown channel (' + chan + ') in input at byte offset ' + (bit_index >> 3))
-                    result = RESULT_CHANNEL_NOT_FOUND
-                    break;
+                if (decoder.processor) {
+                    decoder.processor(decoder_out, processor_data)
                 }
+                bit_index += res
             }
+        } else {
+            ERROR('Unknown channel (' + chan + ') in input at bit offset ' + (bit_index))
+            result = RESULT_CHANNEL_NOT_FOUND
+            break
+        }
+        /* At the end of this, we must jump to the next byte boundary, if not there already. */
+        if (bit_index & 0x7) {
+            TRACE('WARNING: non-byte-aligned after decoder at bit ' + bit_index)
+            bit_index += 8
+            bit_index &= ~(0x7)
         }
     }
 
@@ -301,13 +358,11 @@ function decoder(bytes, map, platform) {
         ERROR('Decoder FAILED!')
     }
 
-    /* Return the data object or portion of it to the cloud platform */
-    if (platform) {
-        return platform.post_process(processor_data)
-    } else {
-        return processor_data
-    }
+    /* Return the data to the cloud platform */
+    return platform.post_process(processor_data)
 }
+
+
 
 
 /*--- CUT -------------------------------------------------------*/
@@ -317,17 +372,14 @@ module.exports = {
     /* core engine */
     decoder,
 
-    /* cloud platform interface */
-
-
     /* primitive decoders */
     bitfield_decoder,
     //int8_decoder,
-    //uint8_decoder,
+    uint8_decoder,
     //int16_decoder,
     //uint16_decoder,
     //int32_decoder,
-    //uint32_decoder,
+    uint32_decoder,
     //varint32_decoder,
     varuint32_decoder,
     //array_decoder, /* array size is specified by a varuint32 up front */
@@ -338,6 +390,10 @@ module.exports = {
     //batt_level_decoder,
     temp_decoder,
     pm_decoder,
+    accel_decoder,
+
+
+    time_decoder
     
 }
 

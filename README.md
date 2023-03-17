@@ -1,6 +1,6 @@
 ## ELPP - the Measurement{Earth} (Enhanced) Low Power Protocol
 
-This protocol takes the best of all the worlds (IoT and blockchain) and creates a unique and dynamic framework for doing just about anything over a wired or wireless link.
+This protocol takes the best of all the worlds and creates a unique and dynamic framework for doing just about anything over a wired or wireless link.
 
 Especially suited to IoT devices running LoRaWAN, Sigfox and Satellite communication links with traditional cloud or blockchain networks.
 
