@@ -33,6 +33,7 @@ function TRACE_D(msg) {
 }
 
 const log = console.log
+const log_obj = function (obj) { console.dir(obj, { depth: null }) }
 
 function emplace_bits(buf, start_bit, end_bit, bits) {
     /* Setup indices */
@@ -128,9 +129,37 @@ function varint32_encoder(buf, bit_index, data, args) {
     return varuint32_encoder(buf, bit_index, (data << 1) ^ (data >> 31), args)
 }
 
+/* data must be a 'name' string */
 function name_encoder(buf, bit_index, data, args) {
-    for (var i = 0; i < 8; i++) {
-        buf.push(0)
+    const regex = new RegExp(/^[.1-5a-z]{0,12}[.1-5a-j]?$/);
+    if (!regex.test(data)) {
+        throw new Error('Name should be less than 13 characters, or less than 14 if last character is between 1-5 or a-j, and only contain the following symbols .12345abcdefghijklmnopqrstuvwxyz')
+    }
+    const charToSymbol = function (c) {
+        if (c >= 'a'.charCodeAt(0) && c <= 'z'.charCodeAt(0)) {
+            return (c - 'a'.charCodeAt(0)) + 6;
+        }
+        if (c >= '1'.charCodeAt(0) && c <= '5'.charCodeAt(0)) {
+            return (c - '1'.charCodeAt(0)) + 1;
+        }
+        return 0;
+    };
+    const a = new Uint8Array(8);
+    let bit = 63;
+    for (let i = 0; i < data.length; ++i) {
+        let c = charToSymbol(data.charCodeAt(i));
+        if (bit < 5) {
+            c = c << 1;
+        }
+        for (let j = 4; j >= 0; --j) {
+            if (bit >= 0) {
+                a[Math.floor(bit / 8)] |= ((c >> j) & 1) << (bit % 8);
+                --bit;
+            }
+        }
+    }
+    for (let i = 0; i < a.length; i++) {
+        buf.push(a[i])
     }
     return 8 * 8
 }
@@ -140,14 +169,51 @@ function uint8_encoder(buf, bit_index, data, args) {
     return 8
 }
 
-function uint32_encoder(buf, bit_index, data, args) {
-    buf.push((data >> 24) & 0xff)
-    buf.push((data >> 16) & 0xff)
-    buf.push((data >> 8) & 0xff)
+function uint16_encoder(buf, bit_index, data, args) {
     buf.push((data >> 0) & 0xff)
+    buf.push((data >> 8) & 0xff)
+    return 16
+}
+
+function uint32_encoder(buf, bit_index, data, args) {
+    buf.push((data >> 0) & 0xff)
+    buf.push((data >> 8) & 0xff)
+    buf.push((data >> 16) & 0xff)
+    buf.push((data >> 24) & 0xff)
     return 32
 }
 
+
+/* data will be an [array] */
+function fixed_bytearray_encoder(buf, bit_index, data, args) {
+    if (args) {
+        if (data.length >= args.length) {
+            for (var i = 0; i < args.length; i++) {
+                buf.push(data[i])
+            }
+            return args.length << 3;
+        }
+    }
+    return -1
+}
+
+/* data will be [array] */
+function dynamic_bytearray_encoder(buf, bit_index, data, args) {
+    var bits = varuint32_encoder(buf, bit_index, data.length)
+    if (bits > 0) {
+        args = { length: (data.length) }
+        var bits2 = fixed_bytearray_encoder(buf, bit_index + bits, data, args)
+        if (bits2 < 0) {
+            bits = -1;
+        } else {
+            bits += bits2
+        }
+
+    }
+    return bits
+}
+
+/*--- Sensor type encoders -----------------------------------*/
 
 var temp_encoder = [
     { fn: bitfield_encoder, args: { sign: 1, i_bits: 12, f_bits: 4 } },
@@ -175,6 +241,58 @@ var accel_encoder = [
 ]
 
 
+/*--- Antelope protocol encoders -----------------------------*/
+
+var antelope_tapos_encoder = [
+    { fn: uint32_encoder, name: 'expiration_sec' },
+    { fn: uint16_encoder, name: 'ref_block_num' },
+    { fn: uint32_encoder, name: 'ref_block_prefix' },
+    { fn: varuint32_encoder, name: 'max_net_usage_words'},
+    { fn: uint8_encoder, name: 'max_cpu_usage_ms' },
+    { fn: varuint32_encoder, name: 'delay_sec' },
+]
+
+
+var antelope_message_header_encoder = [
+    /*
+     * bits 0-2: a transaction ID (0-7) to aid in element re-assembly 
+     *   Only transaction elements marked with the same trx ID can be reassembled together.
+     * 
+     * */
+    { fn: uint8_encoder, name: 'flags' }
+]
+
+var antelope_message_tapos_encoder = [
+    antelope_message_header_encoder,
+    { fn: uint8_encoder }, /* chain id. 0 - TELOS testnet 1 - TELOS mainnet 2,3,4,5,6,7 reserved. */
+    /* uint32 expiration, uint16 ref block, uint32 ref block prefix */
+    { fn: fixed_bytearray_encoder, args: { length: 10 } }
+    /* max_net, max_cpu and delay_sec set to 0. */
+]
+
+var antelope_message_action_encoder = [
+    antelope_message_header_encoder,
+    /* names: account (dapp), action */
+    { fn: fixed_bytearray_encoder, args: { length: 16 } },
+    /* */
+    /* names: actor, perm */
+    { fn: fixed_bytearray_encoder, args: { length: 16 } }
+
+]
+
+var antelope_message_serialized_action_encoder = [
+    antelope_message_header_encoder,
+    { fn: dynamic_bytearray_encoder },
+]
+
+var antelope_message_signature_encoder = [
+    antelope_message_header_encoder,
+    { fn: fixed_bytearray_encoder, args: { length: 65 } },
+]
+
+/*------------------------------------------------------------*/
+
+
 function encoder_run(buf, bit_index, encoder, provider) {
     var encoded_bits = 0
     for (var i = 0; i < encoder.length; i++) {
@@ -191,7 +309,8 @@ function encoder_run(buf, bit_index, encoder, provider) {
             /* run encoder now */
             if (field_encoder.fn) {
                 var data = provider.shift()
-                log(field_encoder.fn.name + ' encoding ' + data)
+                log(field_encoder.fn.name + ' encoding: ')
+                log_obj(data)
                 var res = field_encoder.fn(buf, bit_index + encoded_bits, data, field_encoder.args)
                 if (res < 0) {
                     return res
@@ -259,6 +378,13 @@ module.exports = {
     temp_encoder,
     pm_encoder,
     accel_encoder,
-    time_encoder
+    time_encoder,
+
+    /* Antelope */
+    antelope_message_header_encoder,
+    antelope_message_tapos_encoder,
+    antelope_message_action_encoder,
+    antelope_message_serialized_action_encoder,
+    antelope_message_signature_encoder,
 
 }

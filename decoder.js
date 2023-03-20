@@ -42,6 +42,9 @@ SOFTWARE.
  *   - Decoders can be layered, i.e. decoders can reference other type decoders not
  *     just primitive decoder functions, effectively forming an 'ABI' made from subtypes.
  *     
+ *   - This is LITTLE ENDIAN protocol.  The lowest byte of a (u)int16, (var)(u)int32 appears first in the payload buffer.
+ *     Bitfields are exempt, however, and are stored in 'natural bit order' with the left-most bit being the most significant bit.
+ *     
  * How to use:
  * 
  *   1. Select a platform decoder (e.g. decoder_datacake.js) and copy and paste it into the
@@ -70,7 +73,7 @@ function TRACE_D(msg) {
 
 
 function ERROR(msg) {
-    if (DEBUG) {
+    if (DO_DEBUG) {
         console.log('ERR: ' + msg)
     }
 }
@@ -217,20 +220,69 @@ function uint8_decoder(buf, bit_index, out) {
     return -1
 }
 
+function uint16_decoder(buf, bit_index, out) {
+    if (check_len(buf, bit_index, 16, 1)) {
+        var index = bit_index >> 3
+        var word =
+            buf[index + 0] << 0 |
+            buf[index + 1] << 8
+        out.push(word & 0xffff)
+        return 16
+    }
+    return -1
+}
+
 function uint32_decoder(buf, bit_index, out) {
     if (check_len(buf, bit_index, 32, 1)) {
         var index = bit_index >> 3
         var word =
-            buf[index + 0] << 24 |
-            buf[index + 1] << 16 |
-            buf[index + 2] << 8 |
-            buf[index + 3] << 0
+            buf[index + 0] << 0 |
+            buf[index + 1] << 8 |
+            buf[index + 2] << 16 |
+            buf[index + 3] << 24
         out.push(word & 0xffffffff)
         return 32
     }
     return -1
 }
 
+
+
+function array_decoder(buf, bit_index, out, args) {
+    
+}
+
+/* Extracts the required number of bytes and returns them as a subarray
+ added to the output
+ */
+function fixed_bytearray_decoder(buf, bit_index, out, args) {
+    if (args) {
+        var nbits = args.length * 8
+        if (check_len(buf, bit_index, nbits, 1)) {
+            var index = bit_index >> 3
+            var arr = buf.slice(index, index + args.length)
+            out.push(arr)
+            return nbits;
+        }
+    }
+    return -1
+}
+
+
+/* A varunit32 is in front of the byte array to provide the length of the array. */
+function dynamic_bytearray_decoder(buf, bit_index, out, args) {
+    var bits = varuint32_decoder(buf, bit_index, out)
+    if (bits > 0) {
+        args = { length: (out[out.length-1]) }
+        var bits2 = fixed_bytearray_decoder(buf, bit_index + bits, out, args)
+        if (bits2 < 0) {
+            bits = -1;
+        } else {
+            bits += bits2
+        }
+    }
+    return bits
+}
 
 /*--- Sensor type decoders ---------------------------------------------------*/
 /* temperature is stored in 16-bits s12q4 format. */
@@ -261,6 +313,95 @@ var time_decoder = [
     { fn: uint8_decoder, name: 'flags' },
     { fn: uint32_decoder, name: 'epoch' }
 ]
+
+/*--- Antelope protocol decoders -----------------------------*/
+
+/* Format of actual TAPOS data encoded in a transaction.
+ * If the decoding platform wanted to examine these fields directly, this could be used.
+ * However this is not sent directly by ME-TSP modules (use antelope_message_tapos_decoder instead)
+ */
+var antelope_tapos_decoder = [
+    { fn: uint32_decoder, name: 'expiration_sec' },
+    { fn: uint16_decoder, name: 'ref_block_num' },
+    { fn: uint32_decoder, name: 'ref_block_prefix' },
+    { fn: varuint32_decoder, name: 'max_net_usage_words' },
+    { fn: uint8_decoder, name: 'max_cpu_usage_ms' },
+    { fn: varuint32_decoder, name: 'delay_sec' },
+]
+
+
+/* To transport specific Antelope transaction elements, these decoders are defined to demark the
+ already-encoded binary data in the payload.
+ */
+
+
+
+/* We have the option of sending a compressed representation of the tapos, action and permission elements,
+ * by omitting certain fields that are fixed like max_net, max_cpu and delay_sec in the TAPOS.
+ */
+
+/* The transaction re-assembler can be built as a 'platform'.  A reference implementation
+ * is provided in decoder-antelope.js
+ * 
+ * The message content handled by fixed_array_decoders can be inserted directly
+ * into the re-assembled transaction.
+ */
+
+var antelope_message_header_decoder = [
+    /*
+     * bits 0-2: a transaction ID (0-7) to aid in element re-assembly 
+     *   Only transaction elements marked with the same trx ID can be reassembled together.
+     * bits 3-5: 
+     * 
+     * */
+    { fn: uint8_decoder, name: 'flags' } 
+]
+
+/* The Measurement{Earth} Trusted Sensor Platform modules signs with 
+ *  max_net, max_cpu and delay_sec set to 0.
+ */
+var antelope_message_tapos_decoder = [
+    antelope_message_header_decoder,
+    { fn: uint8_decoder, name: 'chain' }, /* chain id. 0 - TELOS testnet 1 - TELOS mainnet 2,3,4,5,6,7 reserved. */
+    /* uint32 expiration, uint16 ref block, uint32 ref block prefix */
+    { fn: fixed_bytearray_decoder, args: { length: 10 }, name: 'tapos' }
+    /* max_net, max_cpu and delay_sec set to 0. */
+]
+
+/* The Measurement{Earth} Trusted Sensor Platform modules signs with
+ *  num_actions and num_permissions set to 1.
+ */
+var antelope_message_action_decoder = [
+    antelope_message_header_decoder,
+    /* names: account (dapp), action */
+    { fn: fixed_bytearray_decoder, args: { length: 16 }, name: 'dapp info' },
+    /* */
+    /* names: actor, perm */
+    { fn: fixed_bytearray_decoder, args: { length: 16 }, name: 'actor info' }
+]
+
+/* The Measurement{Earth} Trusted Sensor Platform modules signs with
+ *  num_actions and num_permissions set to 1.
+ */
+var antelope_message_serialized_action_decoder = [
+    antelope_message_header_decoder,
+    { fn: dynamic_bytearray_decoder, name: 'action data' },
+]
+
+/* Contains
+ *  Signature i(1), R(32) and S(32)
+ */
+var antelope_message_signature_decoder = [
+    antelope_message_header_decoder,
+    { fn: fixed_bytearray_decoder, args: { length: 65 }, name: 'signature' },
+]
+
+/* --- Measurement{Earth} Antelope action decoders */
+
+
+
+/*------------------------------------------------------------*/
+
 
 
 /*--- Decoder Engine ---------------------------------------------------------*/
@@ -393,7 +534,15 @@ module.exports = {
     accel_decoder,
 
 
-    time_decoder
+    time_decoder,
+
+    /* Antelope */
+    antelope_message_header_decoder,
+    antelope_message_tapos_decoder,
+    antelope_message_action_decoder,
+    antelope_message_serialized_action_decoder,
+    antelope_message_signature_decoder,
+
     
 }
 
