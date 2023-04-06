@@ -396,6 +396,10 @@ var antelope_message_signature_decoder = [
     { fn: fixed_bytearray_decoder, args: { length: 65 }, name: 'signature' },
 ]
 
+var antelope_message_tapos_req_decoder = [
+    { fn: uint8_decoder, name: 'chain' }, /* chain id. 0 - TELOS testnet 1 - TELOS mainnet 2,3,4,5,6,7 reserved. */
+]
+
 /* --- Measurement{Earth} Antelope action decoders */
 
 
@@ -542,6 +546,7 @@ module.exports = {
     antelope_message_action_decoder,
     antelope_message_serialized_action_decoder,
     antelope_message_signature_decoder,
+    antelope_message_tapos_req_decoder,
 
     
 }

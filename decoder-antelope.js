@@ -61,27 +61,27 @@ SOFTWARE.
         "compression": false,
         "packed_context_free_data": "",
         "packed_trx": "e5f23660ec64123a7f1d000000000180b1ba1967ea30550000000064278fc601a0129d2164ea3055000000004887337526a0129d2164ea30550b4d452d5453502d524649442d0200000d636238636564642d646972747900"
+     }
+  
+  To use this module, the user must supply to the decode function an object to record state for *each device* across messages.
+  The object must have an empty object called 'trx_map'
+  E.g.:
+
+    var decoder_state = {
+        trx_map: { }
+    }
+
  */
 
-/* A dispatcher list handles in-flight transactions 
- * This is outside the scope of this module.
- */
-dispatcher_queue = {
-    0: [],
-    1: []
-}
+const log = console.log
+const log_obj = function (obj) { console.dir(obj, { depth: null }) }
+const crypto = require('crypto')
+const elpp = require('./decoder')
 
 
-
-/* The decoder is called multiple times to gather all necessary transaction components
- * therefore state must persist outside the scope of the decoder's 'object'.
- * A trx_map tracks components for the same transaction ID.
- * A trx_map must exist independently for each device seen.
- */
-
-var trx_map = {}
 
 function new_trx() {
+    
     return {
         chain : 0,
         signature : null, /* 'SIG_K1...' */
@@ -91,17 +91,18 @@ function new_trx() {
     }
 }
 
-function get_trx(id) {
+function get_trx(obj, id) {
     var trx
-    if (id in trx_map) {
-        trx = trx_map[id]
+    if (id in obj.state.trx_map) {
+        trx = obj.state.trx_map[id]
     } else {
-        trx = trx_map[id] = new_trx()
+        trx = obj.state.trx_map[id] = new_trx()
     }
+    trx.last_epoch = Date.now() / 1000 >> 0
     return trx
 }
 
-function check_dispatch(trx_id, trx) {
+function check_dispatch(obj, trx_id, trx) {
     /* If have all componenents, can convert to JSON and dispatch it to the appropropriate
      * chain dispatcher.  The dispatcher should handle selection of API endpoint, retries, etc.
      */
@@ -111,36 +112,41 @@ function check_dispatch(trx_id, trx) {
             signatures: [trx.signature],
             compression: false,
             packed_context_free_data: '',
-            packed_trx: Buffer.concat([trx.tapos, trx.action, trx.data]).toString('hex')
+            /* To note that there is also a 'context free array' that comes after TAPOS
+             * and before ACTION in the serialized data section as well, this must be
+             * set to 0.
+             */
+            packed_trx: Buffer.concat([trx.tapos, Buffer.from([0]), trx.action, trx.data]).toString('hex')
         }
 
         log('transaction complete:')
 
         let json = JSON.stringify(transaction, null, 2)
         log(json)
-        /* Move it to the dispatcher queue for the chain */
-        dispatcher_queue[trx.chain].push(json)
+
+
+        if (0) {
+            let epoch = Date.now() / 1000 >> 0
+            /* Move it to the dispatcher queue for the chain */
+            obj.state.dispatcher_queue[trx.chain].push({
+                epoch: epoch,
+                started: false,
+                json: json
+            })
+        }
+
+        /* Return the completed trx with some metadata */
+        obj.trx = {
+            chain: trx.chain,
+            json: json
+        }
 
         /* Remove the transaction from the map */
-        delete trx_map[trx_id]
+        delete obj.state.trx_map[trx_id]
     }
 }
 
-/* Because the Antelope decoder state must persist across invocations of 'decoder()' we don't
- * use the per-decoder-invocation object instance.
- */
-var platform = {
-    /* Setup the object in a platform specific way */
-    pre_process: function (obj) {
-        
-        
-    },
-    /* Post process and return the data specific to the platform */
-    post_process: function (obj) {
 
-        return obj
-    }
-}
 
 /* In each of these 'processor' functions, the decoder's decoded output
  * stored in the 'out' array is captured and processed accordingly.
@@ -155,34 +161,35 @@ function antelope_message_tapos_processor(out, obj) {
     var trx_id = header & 0x7 
     var chain_id = out[1] & 0x7
 
-    var trx = get_trx(trx_id)
+    var trx = get_trx(obj, trx_id)
     if (trx.tapos == null) {
         trx.chain = chain_id
-        trx.tapos = Buffer.from(out[2])
+        var data = Buffer.from(out[2])
+        trx.tapos = Buffer.alloc(13)
+        /* max net, max cpu, delay sec all 0 */
+        data.copy(trx.tapos)
     }
     log('have tapos: ')
     log_obj(trx.tapos)
-    check_dispatch(trx_id, trx)
+    check_dispatch(obj, trx_id, trx)
 }
 
 function antelope_message_action_processor(out, obj) {
     var header = out[0]
     var trx_id = header & 0x7
-    var trx = get_trx(trx_id)
+    var trx = get_trx(obj, trx_id)
     if (trx.action === null) {
         /* Re-encode the action by inserting the array length fields */
         /* 1 action, dapp name, action name, 1 perm, perm name, actor name */
-        var action = []
-        action.push(1) /* varuint32 -> encodes '1' as simply 0x1 */
-        action = action.concat(out[1])
-        action.push(1)
-        action = action.concat(out[2])
-
-        trx.action = Buffer.from(action)
+        trx.action = Buffer.alloc(34)
+        trx.action.writeUInt8(1, 0) /* varuint32 -> encodes '1' as simply 0x1 */
+        Buffer.from(out[1]).copy(trx.action, 1)
+        trx.action.writeUInt8(1, 17) /* varuint32 -> encodes '1' as simply 0x1 */
+        Buffer.from(out[2]).copy(trx.action, 18)
     }
     log('have action: ')
     log_obj(trx.action)
-    check_dispatch(trx_id, trx)
+    check_dispatch(obj, trx_id, trx)
 
 }
 
@@ -190,14 +197,14 @@ function antelope_message_serialized_action_processor(out, obj) {
     var header = out[0]
     var trx_id = header & 0x7
 
-    var trx = get_trx(trx_id)
+    var trx = get_trx(obj, trx_id)
     if (trx.data === null) {
         /*  */
         trx.data = Buffer.from(out[2])
     }
     log('have action data: ')
     log_obj(trx.data)
-    check_dispatch(trx_id, trx)
+    check_dispatch(obj, trx_id, trx)
 
 }
 
@@ -212,7 +219,7 @@ function antelope_message_signature_processor(out, obj) {
     var header = out[0]
     var trx_id = header & 0x7
 
-    var trx = get_trx(trx_id)
+    var trx = get_trx(obj, trx_id)
     if (trx.signature === null) {
         
         var sig_k1 = check_encode_k1(Buffer.from(out[1]))
@@ -221,128 +228,13 @@ function antelope_message_signature_processor(out, obj) {
     log('have signature: ')
     log_obj(trx.signature)
 
-    check_dispatch(trx_id, trx)
-}
-
-/*------ CUT ------------------------*/
-/* Testing */
-var crypto = require('crypto');
-const elpp = require('./decoder')
-const encoder = require('./encoder')
-const log = console.log
-const log_obj = function (obj) { console.dir(obj, { depth: null }) }
-log('starting decoder-antelope tests')
-
-/* This could be a simple counter incrementing for each transaction */
-var test_trx_id = 5
-var test_chain_id = 1
-
-function antelope_message_tapos_provider() {
-    /* Provide flags (1) , chain_id (1), data (10 bytes)
-     */
-
-    /* Expiration one hour from now. */
-    var chain_date = Date.now()
-    var expiration = ((chain_date / 1000) >> 0) + 3600 
-
-    var tapos = Buffer.alloc(10)
-    tapos.writeUInt32LE(expiration, 0)
-    tapos.writeUInt16LE(0x1234, 4)
-    tapos.writeUInt32LE(0xCAFEBABE, 6)
-    var data = [
-        test_trx_id & 0x7, /*header */
-        test_chain_id,
-        tapos
-    ]
-
-    return data
-}
-
-function antelope_message_action_provider() {
-
-    /* Provide two arrays of 16 each:
-     *  dapp, action names
-     *  permission, actor names
-     */
-    var buf1 = []
-    var bits1 = encoder.name_encoder(buf1, 0, 'airv11.meas')
-    bits1 += encoder.name_encoder(buf1, bits1, 'submitv1')
-
-    var buf2 = []
-    var bits2 = encoder.name_encoder(buf2, 0, 'active')
-    bits2 += encoder.name_encoder(buf2, bits2, 'a11111c.meas')
-
-    return [
-        test_trx_id & 0x7, /*header */
-        buf1,
-        buf2
-    ]
-}
-
-function antelope_message_serialized_action_provider() {
-    /* The action's arguments.  TSP-AIR submitv1 data is 82 bytes */
-
-    var buf = crypto.randomBytes(82)
-    return [
-        test_trx_id & 0x7, /*header */
-        buf
-    ]
-}
-
-function antelope_message_signature_provider() {
-
-    var buf = crypto.randomBytes(65)
-    buf[0] = 1 /* i ranges from 0-3 */
-    return [
-        test_trx_id & 0x7, /*header */
-        buf
-    ]
-    
-}
-
-function time_provider() {
-    return [0x1, (Date.now() / 1000) >> 0]
-}
-
-var encoder_map = {
-    0: { encoder: encoder.antelope_message_tapos_encoder, provider: antelope_message_tapos_provider },
-    1: { encoder: encoder.antelope_message_action_encoder, provider: antelope_message_action_provider },
-    2: { encoder: encoder.antelope_message_serialized_action_encoder, provider: antelope_message_serialized_action_provider },
-    3: { encoder: encoder.antelope_message_signature_encoder, provider: antelope_message_signature_provider },
-
-    //10: { encoder: encoder.time_encoder, provider: time_provider }
-}
-
-var test_vec1 = encoder.encoder([0, 1], encoder_map)
-log(Buffer.from(test_vec1).toString('hex'))
-var test_vec2 = encoder.encoder([2], encoder_map)
-log(Buffer.from(test_vec2).toString('hex'))
-var test_vec3 = encoder.encoder([3], encoder_map)
-log(Buffer.from(test_vec3).toString('hex'))
-
-var test_vec4 = encoder.encoder([3,2,1,0], encoder_map)
-log(Buffer.from(test_vec4).toString('hex'))
-
-
-var channel_map = {
-    0: { decoder: elpp.antelope_message_tapos_decoder, processor: antelope_message_tapos_processor },
-    1: { decoder: elpp.antelope_message_action_decoder, processor: antelope_message_action_processor },
-    2: { decoder: elpp.antelope_message_serialized_action_decoder, processor: antelope_message_serialized_action_processor },
-    3: { decoder: elpp.antelope_message_signature_decoder, processor: antelope_message_signature_processor },
-    //10: { decoder: elpp.time_decoder, processor: time_processor }
+    check_dispatch(obj, trx_id, trx)
 }
 
 
-var result1 = elpp.decoder(test_vec1, channel_map, platform)
-log_obj(result1)
-var result2 = elpp.decoder(test_vec2, channel_map, platform)
-log_obj(result2)
-var result3 = elpp.decoder(test_vec3, channel_map, platform)
-log_obj(result3)
-
-var result4 = elpp.decoder(test_vec4, channel_map, platform)
-log_obj(result4)
-
+function antelope_message_tapos_req_processor(out, obj) {
+    log('need tapos')
+}
 
 
 /*
@@ -367,4 +259,80 @@ function to_b58(B) {
 };
 
 
+var channel_map = {
+    0: { decoder: elpp.antelope_message_tapos_decoder, processor: antelope_message_tapos_processor },
+    1: { decoder: elpp.antelope_message_action_decoder, processor: antelope_message_action_processor },
+    2: { decoder: elpp.antelope_message_serialized_action_decoder, processor: antelope_message_serialized_action_processor },
+    3: { decoder: elpp.antelope_message_signature_decoder, processor: antelope_message_signature_processor },
+    4: { decoder: elpp.antelope_message_tapos_req_decoder, processor: antelope_message_tapos_req_processor },
+}
 
+function decoder(payload, state) {
+    /* Because the Antelope decoder state must persist across invocations of 'decoder()' we 
+     * must setup the decoder's transient state object with our persistent decoder state.
+     */
+    var platform = {
+        /* Setup the object in a platform specific way */
+        pre_process: function (obj) {
+            obj.state = state /* persistent state */
+
+        },
+        /* Post process and return the data specific to the platform */
+        post_process: function (obj) {
+
+            return obj
+        }
+    }
+
+    return elpp.decoder(payload, channel_map, platform)
+}
+
+function get_status(trx_map) {
+    /* print all active IDs and what they are waiting for */
+    let str = ''
+    for (i in trx_map) {
+        let trx = trx_map[i]
+        str += 'trx ' + i
+        if (!trx.signature) {
+            str += ' needs'
+        } else {
+            str += ' has'
+        }
+        str += ' signature'
+
+        if (!trx.tapos) {
+            str += ' needs'
+        } else {
+            str += ' has'
+        }
+        str += ' tapos'
+
+        if (!trx.action) {
+            str += ' needs'
+        } else {
+            str += ' has'
+        }
+        str += ' action'
+
+        if (!trx.data) {
+            str += ' needs'
+        } else {
+            str += ' has'
+        }
+
+        str += ' data\n'
+    }
+    return str
+}
+
+function new_state() {
+    return {
+        trx_map: {}
+    }
+}
+
+module.exports = {
+    decoder,
+    get_status,
+    new_state
+}
