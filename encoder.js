@@ -21,7 +21,8 @@ SOFTWARE.
 */
 
 /*
- * The encoder is used to create test inputs for the decoder.
+ * The encoder is used to create test inputs for the decoder
+ * and create downlink payloads.
  */
 
 var DEBUG = true
@@ -48,13 +49,14 @@ function emplace_bits(buf, start_bit, end_bit, bits) {
     /* Case 1: start and end bit land within same byte */
     if (byte_start == byte_end) {
         /* move bits into position */
-        bits <<= (7 - bit_start)
+        bits <<= (7 - bit_end)
         bits &= 0xff
         if (byte_start < buf.length) {
             buf[byte_start] |= bits
         } else {
             buf.push(bits)
         }
+        TRACE_D('  B' + byte_start + ' bits ' + bits.toString(16))
     }
     /* Case 2: start and end bits land on different bytes */
     else {
@@ -215,18 +217,16 @@ function dynamic_bytearray_encoder(buf, bit_index, data, args) {
 
 /*--- Sensor type encoders -----------------------------------*/
 
-var temp_encoder = [
+var temperature_encoder = [
     { fn: bitfield_encoder, args: { sign: 1, i_bits: 12, f_bits: 4 } },
 ]
 
-var pm_encoder = [
+var particle_encoder = [
+    { fn: uint8_encoder, name: 'flags' },
     { fn: bitfield_encoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
     { fn: bitfield_encoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
     { fn: bitfield_encoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
     { fn: bitfield_encoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
-    { fn: varuint32_encoder },
-    temp_encoder,
-    { fn: name_encoder }
 ]
 
 var time_encoder = [
@@ -375,8 +375,8 @@ module.exports = {
 
     /* Sensor data encoders */
     //batt_level_encoder,
-    temp_encoder,
-    pm_encoder,
+    temperature_encoder,
+    particle_encoder,
     accel_encoder,
     time_encoder,
 

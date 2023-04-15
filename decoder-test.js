@@ -55,7 +55,7 @@ function accel_processor(out, data) {
  */
 
 var channel_map = {
-    0: { decoder: elpp.temp_decoder, processor: temp_processor },
+    0: { decoder: elpp.temperature_decoder, processor: temp_processor },
     1: { decoder: elpp.pm_decoder, processor: pm_processor },
     2: { decoder: elpp.accel_decoder, processor: accel_processor },
     10: { decoder: elpp.time_decoder, processor: time_processor }
@@ -74,7 +74,7 @@ var platform = {
 
 
 
-function temp_provider() {
+function temperature_provider() {
     return [-12.7]
 }
 
@@ -100,7 +100,7 @@ function accel_provider() {
 }
 
 var encoder_map = {
-    0: { encoder: encoder.temp_encoder, provider: temp_provider },
+    0: { encoder: encoder.temperature_encoder, provider: temperature_provider },
     1: { encoder: encoder.pm_encoder, provider: pm_provider },
     2: { encoder: encoder.accel_encoder, provider: accel_provider },
     10: {encoder : encoder.time_encoder, provider: time_provider}
@@ -114,4 +114,6 @@ log(Buffer.from(test_vec).toString('hex'))
 log('== decoded ==')
 var result = elpp.decoder(test_vec, channel_map, platform)
 log_obj(result)
+
+
 

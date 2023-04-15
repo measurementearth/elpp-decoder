@@ -120,6 +120,7 @@ function capture_bits(buf, start_bit, end_bit) {
         bits <<= bit_start /* 0,1,2.. */
         bits &= 0xff
         bits >>= (bit_start + (7 - bit_end)) /* ..5,6,7 */
+        TRACE_D('  B' + byte_start + ' bits ' + bits.toString(16))
         return bits
     } /* Case 2: start and end bits land on different bytes */
     else {
@@ -285,27 +286,81 @@ function dynamic_bytearray_decoder(buf, bit_index, out, args) {
 }
 
 /*--- Sensor type decoders ---------------------------------------------------*/
+/* Note!
+ * These are all designed to fit into an SF10 payload (max 11 bytes)
+ */
+
 /* temperature is stored in 16-bits s12q4 format. */
-var temp_decoder = [
+var temperature_decoder = [
     { fn: bitfield_decoder, args: { sign: 1, i_bits: 12, f_bits: 4 } },
 ]
 
-var pm_decoder = [
-    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
-    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
-    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
-    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 } },
-    { fn: varuint32_decoder },
-    temp_decoder,
-    { fn: name_decoder }
+var adc_decoder = [
+    { fn: uint16_decoder },
+]
+
+/* packed into 10 bytes */
+var location_decoder = [
+    { fn: bitfield_decoder, args: { sign: 1, i_bits: 8, f_bits: 20 }, name: 'lat 0.000001' }, /* +/- 90 */
+    { fn: bitfield_decoder, args: { sign: 1, i_bits: 9, f_bits: 20 }, name: 'lon 0.000001' }, /* +/- 180 */
+    { fn: bitfield_decoder, args: { sign: 1, i_bits: 17, f_bits: 6 }, name: 'alt 0.015 m' }, /* max alt 131,072 m */
+]
+
+var humidity_decoder = [
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 7, f_bits: 1 }, name: 'rh 0.5%' },
+]
+
+var pressure_decoder = [
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 12, f_bits: 4 }, name:'hPa q4 %' },
+]
+
+var particle_decoder = [
+    { fn: uint8_decoder, name: 'flags' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 }, name: 'pm1.0' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 }, name: 'pm2.5'  },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 }, name: 'pm4.0'  },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 10, f_bits: 0 }, name: 'pm10.0'  },
 ]
 
 var accel_decoder = [
-    { fn : varint32_decoder, name: 'x' },
-    { fn : varint32_decoder, name: 'y' },
-    { fn : varint32_decoder, name: 'z' }
+    { fn: varint32_decoder, name: 'x' },
+    { fn: varint32_decoder, name: 'y' },
+    { fn: varint32_decoder, name: 'z' }
 ]
 
+var motion_decoder = [
+    { fn : uint8_decoder, name: 'flags' },
+    accel_decoder
+]
+
+var locmeta_decoder = [
+    { fn: uint8_decoder, name: 'ttff_s' },
+    { fn: uint8_decoder, name: 'nsats' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 4, f_bits: 4 }, name: 'dop_q4' },
+    { fn: uint8_decoder, name: 'flags' },
+]
+
+var satcom_decoder = [
+    { fn: uint8_decoder, name: 'rssi' },
+    { fn: varuint32_decoder, name: 'energy' },
+]
+
+var satmeta_decoder = [
+    { fn: varuint32_decoder, name: 'tx_counter' },
+    { fn: uint8_decoder, name: 'tx_time_s' },
+    { fn: uint8_decoder, name: 'tx_dropped_counter' },
+    { fn: uint8_decoder, name: 'data_dropped_counter' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 4, f_bits: 0 }, name: 'retry_period_min' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 4, f_bits: 0 }, name: 'rssi_0_5' },
+    { fn: varuint32_decoder, name: 'energy' },
+]
+
+var battery_decoder = [
+    { fn: uint16_decoder, name: 'voltage_mv' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'current_ua' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'accum_current_uah' },
+    temperature_decoder
+]
 
 /*--- System decoders ---------------------------------------------------*/
 
@@ -313,6 +368,20 @@ var time_decoder = [
     { fn: uint8_decoder, name: 'flags' },
     { fn: uint32_decoder, name: 'epoch' }
 ]
+
+var devstartup_decoder = [
+    { fn: uint8_decoder, name: 'fw_ver_major' }, 
+    { fn: uint16_decoder, name: 'fw_ver_minor' },
+    { fn: uint8_decoder, name: 'fw_ver_patch' },
+    { fn: uint16_decoder, name: 'reset_flags' }
+]
+
+var faultinfo_decoder = [
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'pc' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'lr' },
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'sp' },
+]
+
 
 /*--- Antelope protocol decoders -----------------------------*/
 
@@ -532,13 +601,23 @@ module.exports = {
     name_decoder,
 
     /* Sensor data decoders */
-    //batt_level_decoder,
-    temp_decoder,
-    pm_decoder,
+    temperature_decoder,
+    adc_decoder,
+    location_decoder,
+    humidity_decoder,
+    pressure_decoder,
+    particle_decoder,
     accel_decoder,
+    motion_decoder,
+    locmeta_decoder,
+    satcom_decoder,
+    satmeta_decoder,
+    battery_decoder,
 
 
     time_decoder,
+    devstartup_decoder,
+    faultinfo_decoder,
 
     /* Antelope */
     antelope_message_header_decoder,
