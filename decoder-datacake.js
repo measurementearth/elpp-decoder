@@ -99,7 +99,9 @@ function temperature_processor(out, obj) {
 }
 
 function adc_processor(out, obj) {
-    obj.data.push(make_struct('ADC', out[0]))
+    /* data provided in units of millivolts */
+    var level = out[0] / 1000
+    obj.data.push(make_struct('BATTERY_LEVEL', level))
 }
 
 function location_processor(out, obj) {
@@ -200,10 +202,14 @@ function satmeta_processor(out, obj) {
 }
 
 function battery_processor(out, obj) {
-    obj.data.push(make_struct('BATTERY_VOLTAGE', out[0]))
-    obj.data.push(make_struct('BATTERY_CURRENT', out[1]))
-    obj.data.push(make_struct('BATTERY_ACCUM_CURRENT', out[2]))
-    obj.data.push(make_struct('BATTERY_TEMP', out[3]))
+    /* data provided in units of millivolts */
+    var volt = out[0] / 1000
+    /* current in units of uA and shown in mA */
+    var current = out[1] / 1000
+    var accum_current = out[2] / 1000
+    obj.data.push(make_struct('BATTERY_VOLTAGE', volt))
+    obj.data.push(make_struct('BATTERY_CURRENT', current))
+    obj.data.push(make_struct('BATTERY_ACCUM_CURRENT', accum_current))    obj.data.push(make_struct('BATTERY_TEMP', out[3]))
 }
 
 
