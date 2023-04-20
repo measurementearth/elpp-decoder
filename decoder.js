@@ -466,7 +466,10 @@ var antelope_message_signature_decoder = [
 ]
 
 var antelope_message_tapos_req_decoder = [
-    { fn: uint8_decoder, name: 'chain' }, /* chain id. 0 - TELOS testnet 1 - TELOS mainnet 2,3,4,5,6,7 reserved. */
+    /* chain id. 0 - TELOS testnet 1 - TELOS mainnet 2,3,4,5,6,7 reserved. */
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 4, f_bits: 0 }, name: 'chain_id' },
+    /* request reference number - provided to tapos_resp downlink */
+    { fn: bitfield_decoder, args: { sign: 0, i_bits: 4, f_bits: 0 }, name: 'req_id' },
 ]
 
 /* --- Measurement{Earth} Antelope action decoders */

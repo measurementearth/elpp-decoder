@@ -234,6 +234,11 @@ function antelope_message_signature_processor(out, obj) {
 
 function antelope_message_tapos_req_processor(out, obj) {
     log('need tapos')
+    /* return request to the server */
+    obj.tapos_req = {
+        chain_id: out[0],
+        req_id : out[1]
+    }
 }
 
 
@@ -267,6 +272,11 @@ var channel_map = {
     4: { decoder: elpp.antelope_message_tapos_req_decoder, processor: antelope_message_tapos_req_processor },
 }
 
+/* The antenlope decoder returns:
+ *   trx : {}  This contains the complete JSON transaction (in json property) structure decoded from uplinked data.
+ *             It can be pushed to the v1 chain APIs.
+ *   tapos_req : { chain } If present this means a tapos request was decoded. Contains a 'chain' property.
+ */
 function decoder(payload, state) {
     /* Because the Antelope decoder state must persist across invocations of 'decoder()' we 
      * must setup the decoder's transient state object with our persistent decoder state.

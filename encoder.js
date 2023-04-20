@@ -290,6 +290,24 @@ var antelope_message_signature_encoder = [
     { fn: fixed_bytearray_encoder, args: { length: 65 } },
 ]
 
+/* Response to the tapos request */
+var antelope_message_tapos_resp_encoder = [
+    /* chain id. 0 - TELOS testnet 1 - TELOS mainnet 2,3,4,5,6,7 reserved. */
+    { fn: bitfield_encoder, args: { sign: 0, i_bits: 4, f_bits: 0 }, name: 'chain_id' },
+    /* request reference number - provided to tapos_resp downlink */
+    { fn: bitfield_encoder, args: { sign: 0, i_bits: 4, f_bits: 0 }, name: 'req_id' },
+    /* reference system time provided by server to use by device to set its system time.
+    Transport-specific on how this is used to set time.
+    (Device sets its own expiry time based on the system time that may be
+    provided by this)
+    */
+    { fn: uint32_encoder, name: 'time_sec' },
+    { fn: uint16_encoder, name: 'time_msec' },
+    /* TAPOS data from the blockchain - good for 9 hours (@ 2 blocks/sec)*/
+    { fn: uint16_encoder, name: 'ref_block_num' },
+    { fn: uint32_encoder, name: 'ref_block_prefix' },
+]
+
 /*------------------------------------------------------------*/
 
 
@@ -386,5 +404,6 @@ module.exports = {
     antelope_message_action_encoder,
     antelope_message_serialized_action_encoder,
     antelope_message_signature_encoder,
+    antelope_message_tapos_resp_encoder,
 
 }
