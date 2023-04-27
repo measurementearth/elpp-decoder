@@ -33,13 +33,57 @@ const elpp = require('./decoder')
 const elpp_encoder = require('./encoder')
 const log = console.log
 const log_obj = function (obj) { console.dir(obj, { depth: null }) }
-log('Starting Antelope server')
 
 /* Use 'request' instead of 'http' to handle redirects on endpoints such as Helium downlink URLs */
 const { http, https } = require('follow-redirects')
 //const http = require('http')
-const host = '<your ip here>'
-const port = 2000
+
+
+/* Setup server based on passed-in arguments:
+ *   arg1: network interface name to search for ipv4 address, or if not found, ip-address to listen on
+ *   arg2: server's port
+ */
+const os = require('os')
+const networkInterfaces = os.networkInterfaces()
+
+let host = 'localhost'
+let port = 2000
+
+const args = process.argv.slice(2);
+if (args && args.length >= 2) {
+
+    /* First arg is:
+     *   (a) : the network interface name to look up for first ipv4 family address, or
+     *   (b) : the host
+     */
+    let iface = args[0]
+    if (iface in networkInterfaces) {
+        let addrs = networkInterfaces[iface]
+        for (i in addrs) {
+            if (addrs[i].family && addrs[i].family.toLowerCase() === 'ipv4') {
+                host = addrs[i].address
+                log('found ' + host + ' in ' + iface)
+                break
+            }
+        }
+    } else {
+        let ifaces = ''
+        for (i in networkInterfaces) {
+            ifaces += i + ', '
+        }
+        log('could not find ' + iface + ' in [' + ifaces + ']')
+        host = iface
+    }
+
+    /* port is second arg */
+    port = parseInt(args[1])
+
+} else {
+    log('need arguments: <iface-name|ip-addr> <port>')
+    process.exit(1)
+}
+
+log('Starting ELPP Antelope server on ' + host + ':' + port)
 
 
 /* A dispatcher list handles in-flight transactions 
@@ -186,6 +230,17 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
             }
 
         })
+        hres.on('error', (err) => {
+            log('POST xfer error: ' + err.message)
+            if (res) {
+                res.statusCode = 500
+                res.end('POST xfer error: ' + err.message)
+            }
+            if (1 /* res.statusCode == 200 */) {
+                chain_q.splice(chain_q_index, 1)
+                log('trx removed from queue at ' + chain_q_index)
+            }
+        })
     })
 
     /* Ideally if timeouts can be differentiated from other errors - this is when we would want to try again */
@@ -275,12 +330,42 @@ function push_trx(trx, state, res) {
 let device_states = {}
 
 
+function manage_device_state(state, key) {
+    log('Managing device ['+ key +'] state:')
+    if (state.trx_map) {
+        for (i in state.trx_map) {
+            let trx = state.trx_map[i]
+
+            if (trx.last_epoch) {
+                let trx_epoch = trx.last_epoch
+                let now_epoch = Date.now() / 1000 >> 0
+
+                let age = now_epoch - trx_epoch
+                /* Period before purging is adjustable and depends on 
+                 * the frequency of device measurements and uplinks
+                 * and the number of possible trx_ids.
+                 */
+                if ((age) > 300) {
+                    delete state.trx_map[i]
+                    log('  - Purging device state trx ' + i + ', age too old: ' + age)
+                } else {
+                    log('  - Device state trx ' + i + ' age ok: ' + age)
+                }
+            }
+        }
+    }
+}
+
 function get_device_state(key) {
 
     let state
     if (key in device_states) {
         log('existing state for ' + key)
         state = device_states[key]
+        /* perform state maintenance like purging old/incomplete trx
+         * before it is handed to the decoder 
+         * */
+        manage_device_state(state, key)
     } else {
         log('new state for ' + key)
         state = device_states[key] = antelope.new_state()
@@ -319,11 +404,12 @@ function decodeHelium(data, res) {
     /* Decoder result may have:
      *   trx : {} transaction
      *   tapos_req : request for TAPOS for specified chain
+     *   or nothing if waiting for more data
      */
 
-    if (dresult.trx) {
+    if (dresult && dresult.trx) {
         push_trx(dresult.trx, state, res)
-    } else if (dresult.tapos_req) {
+    } else if (dresult && dresult.tapos_req) {
         /* get_tapos
          * expect key : "downlink_url" :"https://console.helium.com/api/v1/down/..."
          */
@@ -351,7 +437,18 @@ function decodeHelium(data, res) {
             let msg = 'decoder error: no downlink url'
             res.end(msg)
         }
-    } else {
+
+    } else if (dresult) {
+        /* Get the status */
+        log('  - no trx')
+
+        let status = antelope.get_status(state.trx_map)
+        log(status)
+
+        res.writeHead(200)
+        res.end('decoder: need more data\n' + status)
+    }
+    else {
         res.writeHead(500)
         let msg = 'decoder error: no result'
         res.end(msg)
@@ -409,8 +506,6 @@ if (1) {
         console.error(err);
     });
 }
-
-
 
 
 /* Helium JSON example:

@@ -107,6 +107,7 @@ function check_dispatch(obj, trx_id, trx) {
      * chain dispatcher.  The dispatcher should handle selection of API endpoint, retries, etc.
      */
     log('checking for trx id ' + trx_id + ' complete...')
+    log('   => ' + get_status_trx(trx))
     if (trx.signature && trx.tapos && trx.action && trx.data) {
         var transaction = {
             signatures: [trx.signature],
@@ -297,40 +298,47 @@ function decoder(payload, state) {
     return elpp.decoder(payload, channel_map, platform)
 }
 
+function get_status_trx(trx) {
+    let str = ''
+    if (!trx.signature) {
+        str += ' needs'
+    } else {
+        str += ' has'
+    }
+    str += ' signature'
+
+    if (!trx.tapos) {
+        str += ' needs'
+    } else {
+        str += ' has'
+    }
+    str += ' tapos'
+
+    if (!trx.action) {
+        str += ' needs'
+    } else {
+        str += ' has'
+    }
+    str += ' action'
+
+    if (!trx.data) {
+        str += ' needs'
+    } else {
+        str += ' has'
+    }
+
+    str += ' data'
+
+    return str
+}
+
 function get_status(trx_map) {
     /* print all active IDs and what they are waiting for */
     let str = ''
     for (i in trx_map) {
         let trx = trx_map[i]
         str += 'trx ' + i
-        if (!trx.signature) {
-            str += ' needs'
-        } else {
-            str += ' has'
-        }
-        str += ' signature'
-
-        if (!trx.tapos) {
-            str += ' needs'
-        } else {
-            str += ' has'
-        }
-        str += ' tapos'
-
-        if (!trx.action) {
-            str += ' needs'
-        } else {
-            str += ' has'
-        }
-        str += ' action'
-
-        if (!trx.data) {
-            str += ' needs'
-        } else {
-            str += ' has'
-        }
-
-        str += ' data\n'
+        str += get_status_trx(trx) + '\n'
     }
     return str
 }
