@@ -382,6 +382,11 @@ var faultinfo_decoder = [
     { fn: bitfield_decoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'sp' },
 ]
 
+var fwupdate_decoder = [
+    { fn: uint8_decoder, name: 'page' },
+    { fn: uint16_decoder, name: 'chunk' },
+    { fn: dynamic_bytearray_decoder, name: 'data'}
+]
 
 /*--- Antelope protocol decoders -----------------------------*/
 
