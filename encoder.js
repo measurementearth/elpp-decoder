@@ -240,6 +240,13 @@ var accel_encoder = [
     { fn: varint32_encoder, name: 'z' }
 ]
 
+var battery_encoder = [
+    { fn: uint16_encoder, name: 'voltage_mv' },
+    { fn: bitfield_encoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'current_ua' },
+    { fn: bitfield_encoder, args: { sign: 0, i_bits: 24, f_bits: 0 }, name: 'accum_current_uah' },
+    temperature_encoder
+]
+
 
 /*--- Antelope protocol encoders -----------------------------*/
 
@@ -392,7 +399,7 @@ module.exports = {
     name_encoder,
 
     /* Sensor data encoders */
-    //batt_level_encoder,
+    battery_encoder,
     temperature_encoder,
     particle_encoder,
     accel_encoder,

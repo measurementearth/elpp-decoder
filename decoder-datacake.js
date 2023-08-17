@@ -209,7 +209,8 @@ function battery_processor(out, obj) {
     var accum_current = out[2] / 1000
     obj.data.push(make_struct('BATTERY_VOLTAGE', volt))
     obj.data.push(make_struct('BATTERY_CURRENT', current))
-    obj.data.push(make_struct('BATTERY_ACCUM_CURRENT', accum_current))    obj.data.push(make_struct('BATTERY_TEMP', out[3]))
+    obj.data.push(make_struct('BATTERY_ACCUM_CURRENT', accum_current))
+    obj.data.push(make_struct('BATTERY_TEMP', out[3]))
 }
 
 
@@ -327,13 +328,23 @@ function time_provider() {
     return [0x1, (Date.now() / 1000) >> 0]
 }
 
+function battery_provider() {
+    return [
+        3463,
+        34203,
+        12235351,
+        49.7]
+}
+
 var encoder_map = {
     0: { encoder: encoder.temperature_encoder, provider: temperature_provider },
-    10: { encoder: encoder.time_encoder, provider: time_provider }
+    10: { encoder: encoder.time_encoder, provider: time_provider },
+    11: { encoder: encoder.battery_encoder, provider: battery_provider },
+
 }
 
 /* Time is applied to subsequent data only, so must be first in a the encoded payload */
-var test_vec = encoder.encoder([10, 0], encoder_map)
+var test_vec = encoder.encoder([10, 0, 11], encoder_map)
 
 
 /* Extract serial number from the input to the Decoder function.
