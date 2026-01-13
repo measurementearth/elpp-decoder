@@ -86,7 +86,7 @@ if (args && args.length >= 2) {
 log('Starting ELPP Antelope server on ' + host + ':' + port)
 
 
-/* A dispatcher list handles in-flight transactions 
+/* A dispatcher list handles in-flight transactions
  * per chain.
  */
 let dispatch_queue = {
@@ -270,7 +270,8 @@ function hostFromChain(c) {
         case '0':
             return 'testnet.telos.net'
         case '1':
-            return 'mainnet.telos.net'
+            //return 'mainnet.telos.net' // Jan 11, 2026: giving: "Error: fetching abi for eosio: A Request body is required"
+            return 'telos.greymass.com'
         default:
             throw Error('unsupported chain: ' + c)
     }
@@ -341,7 +342,7 @@ function manage_device_state(state, key) {
                 let now_epoch = Date.now() / 1000 >> 0
 
                 let age = now_epoch - trx_epoch
-                /* Period before purging is adjustable and depends on 
+                /* Period before purging is adjustable and depends on
                  * the frequency of device measurements and uplinks
                  * and the number of possible trx_ids.
                  */
@@ -363,7 +364,7 @@ function get_device_state(key) {
         log('existing state for ' + key)
         state = device_states[key]
         /* perform state maintenance like purging old/incomplete trx
-         * before it is handed to the decoder 
+         * before it is handed to the decoder
          * */
         manage_device_state(state, key)
     } else {
@@ -420,8 +421,8 @@ function decodeHelium(data, res) {
 
             const url = new URL(data.downlink_url)
 
-            /* tapos acquisition is a multi-step process 
-             Ideally we have it ready to go and can be sent back, perhaps available for the 2nd downlink slot 
+            /* tapos acquisition is a multi-step process
+             Ideally we have it ready to go and can be sent back, perhaps available for the 2nd downlink slot
              */
             let tapos = tapos_get(dresult.tapos_req.chain_id)
 
@@ -663,7 +664,7 @@ function tapos_manager_run(state) {
                     let json = JSON.parse(info)
 
                     /* Interestingly, the ref_block_prefix is, converted to hex, embedded in the same
-                     * block ID at the 8th byte position in reversed byte order. Which means we can get the 
+                     * block ID at the 8th byte position in reversed byte order. Which means we can get the
                      * prefix right from the block id in the get_info request without making an additional request to get_block.
                      */
                     let ref_block_num = json.last_irreversible_block_num & 0xFFFF;
