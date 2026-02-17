@@ -24,6 +24,34 @@ SOFTWARE.
  * This firmware updater server uses the ELPP protocol to send small chunks
  * of a secure firmware binary patch update file (.sfbp) to a target device
  * running the stm32-secure-patching-bootloader and a lorawan-updater client firmware module.
+ * 
+ * It runs in the process that launches it, so on a desktop PC (nodejs) or in a browser.
+ * The process has to remain running while the update proceeds, which could take 
+ * hours or days, depending on factors such as size of update, mode of update (lazy/trickle or forced) and
+ * reliability of downlinks.
+ * 
+ * This ELPP firmware update protocol is transport agnostic, but is designed with high-latency
+ * asynchronous protocols in mind, such as LoRaWAN and Satellite (e.g. Iridium SBD).
+ * 
+ * There is an optional negotiation that happens at the start; without it the assumption is
+ * "trickle" mode. Trickle mode means the uplink message and downlink chunks are delivered at the rate
+ * of the device's natural uplink frequency, so has the effect of "running in the background". 
+ * The uplink message is piggybacked with other data in the available uplink payload. 
+ * 
+ * The server has option to specify a "forced" mode and the interval to poll at, overriding
+ * the device's natural uplink rate.  This is useful for speeding up a firmware update, at the
+ * expense of increased energy consumption and network costs.
+ * 
+ * 
+ * Updater Implementation
+ * 
+ * An ELPP server must be launched and this updater engine is bound
+ * 
+ * The transport protocol is LoRaWAN, and this updater implementation assumes the Helium network,
+ * accessed through the Public Helium Console service.  The updater thus requires an API download
+ * key
+ * 
+ * The download initializer
  */
 const fs = require('fs')
 const elpp = require('./decoder')

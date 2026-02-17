@@ -80,18 +80,26 @@ if (args && args.length >= 2) {
 
 } else {
     log('need arguments: <iface-name|ip-addr> <port>')
+    log('choose from:')
+    for (iface in networkInterfaces) {
+        log("  - " + "'" + iface + "'")
+    }
     process.exit(1)
 }
 
 log('Starting ELPP Antelope server on ' + host + ':' + port)
 
 
-/* A dispatcher list handles in-flight transactions
- * per chain.
- */
-let dispatch_queue = {
-    0: [], /* TELOS TESTNET */
-    1: []  /* TELOS MAINNET */
+/* Run a manager for each chain */
+const KEY_TELOS_TESTNET = 'TELOS_TESTNET'
+const KEY_TELOS_MAINNET = 'TELOS_MAINNET'
+
+/* Map integer chain IDs to a keys in the chain state object
+These IDs are defined and fixed protocol-wide and end-to-end, meaning the devices
+themselves are transmitting data referencing these chain IDs */
+const CHAIN_KEY_FROM_ID = {
+    0: KEY_TELOS_TESTNET,
+    1: KEY_TELOS_MAINNET
 }
 
 /*
@@ -189,6 +197,10 @@ function dispatch_tapos(tapos_req, tapos, time_ms, path, res) {
 
 }
 
+function remove_trx(chain_q, chain_q_index) {
+    log("trx for '" + chain_q[chain_q_index].key + "' removed from queue at " + chain_q_index)
+    chain_q.splice(chain_q_index, 1)
+}
 
 /* This can be a result of an API request from the remote platform, in which case
  * 'res' will be available to possibly return the result of the blockchain API call.
@@ -225,8 +237,7 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
 
             /* remove the trx whether it succeeded or not (assuming that sending it again will not change the situation) */
             if (1 /* res.statusCode == 200 */) {
-                chain_q.splice(chain_q_index, 1)
-                log('trx removed from queue at ' + chain_q_index)
+                remove_trx(chain_q, chain_q_index)
             }
 
         })
@@ -237,8 +248,7 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
                 res.end('POST xfer error: ' + err.message)
             }
             if (1 /* res.statusCode == 200 */) {
-                chain_q.splice(chain_q_index, 1)
-                log('trx removed from queue at ' + chain_q_index)
+                remove_trx(chain_q, chain_q_index)
             }
         })
     })
@@ -251,8 +261,7 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
             res.end('POST error: ' + err.message)
         }
         if (1 /* res.statusCode == 200 */) {
-            chain_q.splice(chain_q_index, 1)
-            log('trx removed from queue at ' + chain_q_index)
+            remove_trx(chain_q, chain_q_index)
         }
     })
 
@@ -265,31 +274,28 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
 
 }
 
-function hostFromChain(c) {
-    switch (c) {
-        case '0':
-            return 'testnet.telos.net'
-        case '1':
-            //return 'mainnet.telos.net' // Jan 11, 2026: giving: "Error: fetching abi for eosio: A Request body is required"
-            return 'telos.greymass.com'
-        default:
-            throw Error('unsupported chain: ' + c)
-    }
-}
 
-function manage_dispatch_queue(res) {
-    log('manage dispatch queue')
-    for (c in dispatch_queue) {
-        log('checking chain ' + c)
-        let chain_q = dispatch_queue[c]
+/* Try to send transactions pending in each chain's dispatch queue */
+function manage_dispatch_queues(res) {
+    log('manage dispatch queues')
+    for (c in tapos_manager_state) {
+        let state = tapos_manager_state[c]
+        let chain_q = state.dispatch_queue
+        log('checking chain state ' + c + ', queue has ' + chain_q.length + ' items')
         /* for each chain, see what is not started and start them. */
         for (t in chain_q) {
             log('checking trx ' + t)
             let trx = chain_q[t]
             if (!trx.started) {
-                log('dispatching pending trx at index ' + t)
-                dispatch_trx(trx.json, hostFromChain(c), res, chain_q, t)
-                trx.started = true
+                /* Use the last API that successfully acquire TAPOS */
+                if (state.api_last) {
+                    log("dispatching pending trx for '" + trx.key + "' at index " + t + " to '" + state.api_last.host + "'")
+                    dispatch_trx(trx.json, state.api_last.host, res, chain_q, t)
+                    trx.started = true
+                }
+                else {
+                    log('warning: no available dispatch API')
+                }
             }
         }
     }
@@ -302,12 +308,14 @@ function push_trx(trx, state, res) {
 
         let epoch = Date.now() / 1000 >> 0
         /* Move it to the dispatcher queue for the chain */
-        if (trx.chain in dispatch_queue) {
-            log('posting trx to chain ' + trx.chain + ' dispatch queue at ' + dispatch_queue[trx.chain].length)
-            dispatch_queue[trx.chain].push({
+        let dispatch_queue = dispatch_get(trx.chain)
+        if (dispatch_queue) {
+            log('posting trx to chain ' + trx.chain + ' dispatch queue at ' + dispatch_queue.length)
+            dispatch_queue.push({
                 epoch: epoch,
                 started: false,
-                json: trx.json
+                json: trx.json,
+                key: state.key /* propagate device key  */
             })
 
         } else {
@@ -328,6 +336,7 @@ function push_trx(trx, state, res) {
 
 }
 
+/* Temporary state for each communicating device to manage transaction reconstruction */
 let device_states = {}
 
 
@@ -373,6 +382,8 @@ function get_device_state(key) {
     }
     /* Add a 'last used' epoch for possible garbage collection */
     state.last_epoch = Date.now() / 1000 >> 0
+    /* Record device eui for transaction tracing */
+    state.key = key
     return state
 }
 
@@ -455,7 +466,7 @@ function decodeHelium(data, res) {
         res.end(msg)
     }
 
-    manage_dispatch_queue(res)
+    manage_dispatch_queues(res)
 }
 
 const requestListener = function (req, res) {
@@ -527,42 +538,40 @@ if (1) {
 const TAPOS_MANAGER_API_ERRORS_MAX = 5
 const TAPOS_MANAGER_API_CHECK_MAX = 10
 
-/* Run a manager for each chain */
-const KEY_TELOS_TESTNET = 'TELOS_TESTNET'
-const KEY_TELOS_MAINNET = 'TELOS_MAINNET'
-
-const CHAIN_KEY_FROM_ID = {
-    0: KEY_TELOS_TESTNET,
-    1: KEY_TELOS_MAINNET
-}
-
 var tapos_manager_state = {
     [KEY_TELOS_TESTNET]: {
         name : KEY_TELOS_TESTNET,
+        hash : '1eaa0824707c8c16bd25145493bf062aecddfeb56c736f6ba6397f3195f33c9f',
         tapos: {
             acq_time_epoch : 0, /* time of acquisition (not the expiry) */
             ref_block_num: 0,
             ref_block_prefix : 0
         },
         api_pool : [
-            { host: 'http://testnet.telos.net', errors: 0, check_count: 0, use_count : 0 }
-        ]
+            { method: 'http://', host: 'telostestnet.greymass.com', errors: 0, check_count: 0, use_count : 0, version_found : ''  },
+            { method: 'http://', host: 'telostest.api.eosnation.io', errors: 0, check_count: 0, use_count : 0, version_found : ''  }
+        ],
+        api_last : null, /* last API successfully used to acquire TAPOS */
+        dispatch_queue : []
     },
     [KEY_TELOS_MAINNET]: {
         name: KEY_TELOS_MAINNET,
+        hash : '4667b205c6838ef70ff7988f6e8257e8be0e1284a2f59699054a018f743b1d11',
         tapos: {
             acq_time_epoch: 0, /* time of acquisition (not the expiry) */
             ref_block_num: 0,
             ref_block_prefix: 0
         },
         api_pool: [
-            { host: 'http://mainnet.telos.net', errors: 0, check_count: 0, use_count: 0 }
-        ]
+            { method: 'http://', host: 'telos.greymass.com', errors: 0, check_count: 0, use_count: 0, version_found : '' },
+            { method: 'http://', host: 'telos.api.eosnation.io', errors: 0, check_count: 0, use_count: 0, version_found : ''  }
+        ],
+        api_last : null, /* last API successfully used to acquire TAPOS */
+        dispatch_queue : []
     }
-
 }
 
-
+/* Get the TAPOS data associated with the given chain ID value */
 function tapos_get(chain_id) {
     //log('lookup chain_id ' + chain_id)
     if (chain_id in CHAIN_KEY_FROM_ID) {
@@ -572,6 +581,36 @@ function tapos_get(chain_id) {
             let state = tapos_manager_state[key]
             //log('tapos for ' + state.name)
             return state.tapos
+        }
+    }
+    return null
+}
+
+/* Get the dispatch queue associated with the given chain ID value */
+function dispatch_get(chain_id) {
+    //log('lookup chain_id ' + chain_id)
+    if (chain_id in CHAIN_KEY_FROM_ID) {
+        let key = CHAIN_KEY_FROM_ID[chain_id]
+        //log('lookup chain_key ' + key)
+        if (key in tapos_manager_state) {
+            let state = tapos_manager_state[key]
+            //log('tapos for ' + state.name)
+            return state.dispatch_queue
+        }
+    }
+    return null
+}
+
+/* Get the last used API associated with the given chain ID value */
+function api_get(chain_id) {
+    //log('lookup chain_id ' + chain_id)
+    if (chain_id in CHAIN_KEY_FROM_ID) {
+        let key = CHAIN_KEY_FROM_ID[chain_id]
+        //log('lookup chain_key ' + key)
+        if (key in tapos_manager_state) {
+            let state = tapos_manager_state[key]
+            //log('tapos for ' + state.name)
+            return state.api_last
         }
     }
     return null
@@ -622,7 +661,7 @@ function tapos_manager_select_pool(state) {
 
     if (api) {
         api.use_count++;
-        log('TAPOS Manager: selected api ' + api.host + ' uses ' + api.use_count + ' errors ' + api.errors + '  check_count ' + api.check_count)
+        log("TAPOS Manager: selected api '" + api.host + "' uses " + api.use_count + ' errors ' + api.errors + '  check_count ' + api.check_count)
     }
     return api
 }
@@ -645,6 +684,8 @@ function tapos_manager_finish(msg, state, api, timeout) {
         if (api.errors > 0) {
             api.errors--
         }
+        /* set/update the last successfully used API */
+        state.api_last = api
     }
 }
 
@@ -653,7 +694,7 @@ function tapos_manager_run(state) {
 
     let api = tapos_manager_select_pool(state)
     if (api) {
-        let url = api.host + '/v1/chain/get_info'
+        let url = api.method + api.host + '/v1/chain/get_info'
         http.get(url, response => {
             let info = ''
             response.on('data', chunk => {
@@ -667,15 +708,21 @@ function tapos_manager_run(state) {
                      * block ID at the 8th byte position in reversed byte order. Which means we can get the
                      * prefix right from the block id in the get_info request without making an additional request to get_block.
                      */
-                    let ref_block_num = json.last_irreversible_block_num & 0xFFFF;
-                    let last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex');
-                    let ref_block_prefix = last_irr_block_id.readUInt32LE(8);
+                    const ref_block_num = json.last_irreversible_block_num & 0xFFFF;
+                    const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex');
+                    const ref_block_prefix = last_irr_block_id.readUInt32LE(8);
+                    const hash = json.chain_id
+                    if (hash !== state.hash) {
+                        throw new Error("chain hash mismatch for '" + api.host + "', found '" + hash + "', require '" + state.hash + "'")
+                    }
 
                     state.tapos.acq_time_epoch = Date().now / 1000 >> 0
                     state.tapos.ref_block_num = ref_block_num
                     state.tapos.ref_block_prefix = ref_block_prefix
 
-                    log('Aquired TAPOS at ' + Date(state.tapos.acq_time_epoch).toString() + ' for ' + state.name + 'ref_block_num: ' + state.tapos.ref_block_num.toString(16) + ' prefix: ' + state.tapos.ref_block_prefix.toString(16))
+                    api.version_found = json.server_version_string
+
+                    log("Aquired TAPOS at " + (new Date(state.tapos.acq_time_epoch)).toISOString() + " for '" + state.name + "' from '" + url + "' '" + api.version_found + "' ref_block_num: " + state.tapos.ref_block_num.toString(16) + ' prefix: ' + state.tapos.ref_block_prefix.toString(16))
 
                     tapos_manager_finish('success', state, api, timeout)
 
