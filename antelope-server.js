@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2023 Firmware Modules Inc.
+Copyright (c) 2023-2026 Firmware Modules Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -36,6 +36,8 @@ const log_obj = function (obj) { console.dir(obj, { depth: null }) }
 
 /* Use 'request' instead of 'http' to handle redirects on endpoints such as Helium downlink URLs */
 const { http, https } = require('follow-redirects')
+const fs = require('fs')
+const path = require('path')
 //const http = require('http')
 
 
@@ -290,6 +292,7 @@ function manage_dispatch_queues(res) {
                 /* Use the last API that successfully acquire TAPOS */
                 if (state.api_last) {
                     log("dispatching pending trx for '" + trx.key + "' at index " + t + " to '" + state.api_last.host + "'")
+                    state.api_last.trx_count++;
                     dispatch_trx(trx.json, state.api_last.host, res, chain_q, t)
                     trx.started = true
                 }
@@ -318,6 +321,7 @@ function push_trx(trx, state, res) {
                 key: state.key /* propagate device key  */
             })
 
+            state.trx_count++
         } else {
             res.writeHead(500)
             res.end('decoder: unknown chain ' + trx.chain)
@@ -379,6 +383,8 @@ function get_device_state(key) {
     } else {
         log('new state for ' + key)
         state = device_states[key] = antelope.new_state()
+        state.first_epoch = Date.now() / 1000 >> 0
+        state.trx_count = 0
     }
     /* Add a 'last used' epoch for possible garbage collection */
     state.last_epoch = Date.now() / 1000 >> 0
@@ -469,54 +475,90 @@ function decodeHelium(data, res) {
     manage_dispatch_queues(res)
 }
 
+/* Main HTTP listener: keep POST behavior for Helium console requests */
 const requestListener = function (req, res) {
-
-    let data = ''
-
     if (req.method === 'POST') {
-        /* Collect POST data */
-        req.on('data', (chunk) => {
-            data += chunk
-        })
-
-        /* When there is no more data, deal with it */
+        let data = ''
+        req.on('data', (chunk) => { data += chunk })
         req.on('end', () => {
             log(req.url)
             log(req.method)
-
             log(data)
-
             try {
-                /* The decoder is responsible for sending the response in success or error. */
                 decodeHelium(JSON.parse(data), res)
             } catch (e) {
-                /* Get a SyntaxError if JSON can't be parsed, for example */
                 res.writeHead(500)
                 let msg = 'Error: ' + ((e && ('message' in e)) ? e.message : 'unknown')
                 log(msg)
                 res.end(msg)
             }
         })
-    } else {
-        res.writeHead(500)
-        res.end('Unsuported method ' + req.method)
+        return
     }
 
+    res.writeHead(500)
+    res.end('Unsupported method ' + req.method)
 };
+
+/* Dashboard listener: serves static UI and JSON endpoints on a fixed port */
+const DASHBOARD_PORT = 3000
+const dashboardListener = function (req, res) {
+    if (req.method !== 'GET') { res.writeHead(405); res.end('Method Not Allowed'); return }
+    const reqPath = req.url.split('?')[0]
+
+    if (reqPath === '/' ) {
+        res.writeHead(302, { 'Location': '/dashboard' })
+        res.end()
+        return
+    }
+
+    if (reqPath === '/api/device_states') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(device_states))
+        return
+    }
+
+    if (reqPath === '/api/tapos_manager_state') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(tapos_manager_state))
+        return
+    }
+
+    if (reqPath === '/dashboard' || reqPath.startsWith('/dashboard/')) {
+        let relPath = reqPath === '/dashboard' ? '/index.html' : reqPath.replace('/dashboard', '')
+        let filePath = path.join(__dirname, 'dashboard', relPath)
+        fs.readFile(filePath, (err, data) => {
+            if (err) {
+                res.writeHead(404)
+                res.end('Not found')
+            } else {
+                let ext = path.extname(filePath).toLowerCase()
+                let type = 'text/plain'
+                if (ext === '.html') type = 'text/html'
+                else if (ext === '.js') type = 'application/javascript'
+                else if (ext === '.css') type = 'text/css'
+                else if (ext === '.json') type = 'application/json'
+                res.writeHead(200, { 'Content-Type': type })
+                res.end(data)
+            }
+        })
+        return
+    }
+
+    res.writeHead(404)
+    res.end('Not found')
+}
 
 if (1) {
     const server = http.createServer(requestListener);
     server.listen(port, host, () => {
         console.log(`Server is running on http://${host}:${port}`);
     });
-} else {
-    http.get('http://bit.ly/900913', response => {
-        response.on('data', chunk => {
-            console.log(chunk);
-        });
-    }).on('error', err => {
-        console.error(err);
-    });
+    /* Start dashboard server on fixed port bound to same interface */
+    const dashboardServer = http.createServer(dashboardListener)
+    dashboardServer.listen(DASHBOARD_PORT, host, () => {
+        console.log(`Dashboard is available on http://${host}:${DASHBOARD_PORT}/dashboard`)
+    })
 }
 
 
@@ -548,8 +590,8 @@ var tapos_manager_state = {
             ref_block_prefix : 0
         },
         api_pool : [
-            { method: 'http://', host: 'telostestnet.greymass.com', errors: 0, check_count: 0, use_count : 0, version_found : ''  },
-            { method: 'http://', host: 'telostest.api.eosnation.io', errors: 0, check_count: 0, use_count : 0, version_found : ''  }
+            { method: 'http://', host: 'telostestnet.greymass.com', errors: 0, check_count: 0, use_count : 0, trx_count: 0, version_found : ''  },
+            { method: 'http://', host: 'telostest.api.eosnation.io', errors: 0, check_count: 0, use_count : 0, trx_count : 0, version_found : ''  }
         ],
         api_last : null, /* last API successfully used to acquire TAPOS */
         dispatch_queue : []
@@ -563,8 +605,8 @@ var tapos_manager_state = {
             ref_block_prefix: 0
         },
         api_pool: [
-            { method: 'http://', host: 'telos.greymass.com', errors: 0, check_count: 0, use_count: 0, version_found : '' },
-            { method: 'http://', host: 'telos.api.eosnation.io', errors: 0, check_count: 0, use_count: 0, version_found : ''  }
+            { method: 'http://', host: 'telos.greymass.com', errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found : '' },
+            { method: 'http://', host: 'telos.api.eosnation.io', errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found : ''  }
         ],
         api_last : null, /* last API successfully used to acquire TAPOS */
         dispatch_queue : []
