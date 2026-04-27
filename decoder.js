@@ -21,7 +21,7 @@ SOFTWARE.
 */
 
 /* Measurement{Earth} (Enhanced/Earth) Low Power Protocol (ELPP)
- * 
+ *
  * This protocol is designed to meet multiple objectives:
  *   - minimize payload sizes by supporting bitfields
  *   - transport agnostic (LoRaWAN, satellite, IP)
@@ -31,28 +31,28 @@ SOFTWARE.
  */
 
 /* Notes:
- *   - This decoder is meant to work with all javascript engines 
+ *   - This decoder is meant to work with all javascript engines
  *     embedded inside cloud platforms.
  *     Some of these engines don't support 'let' or 'const' or have basic Node
  *     classes available like 'Buffer'.
- *     
+ *
  *   - Type decoders consume input data in multiples of bits, but the the channel byte
  *     must exist on a byte boundary.  The type decoders are packed to fit mutiples of whole bytes.
- *     
+ *
  *   - Decoders can be layered, i.e. decoders can reference other type decoders not
  *     just primitive decoder functions, effectively forming an 'ABI' made from subtypes.
- *     
+ *
  *   - This is LITTLE ENDIAN protocol.  The lowest byte of a (u)int16, (var)(u)int32 appears first in the payload buffer.
  *     Bitfields are exempt, however, and are stored in 'natural bit order' with the left-most bit being the most significant bit.
- *     
+ *
  * How to use:
- * 
+ *
  *   1. Select a platform decoder (e.g. decoder_datacake.js) and copy and paste it into the
  *      first half of your platform's 'payload decoder' section.
  *   2. Copy and paste everything below this up until the ---- CUT ----- line into
  *      the bottom half of your platforms 'payload decoder' section.
- *   3. Embed a call to the 'decoder' function within the platform's 'payloader decoder' 
- *      main function call, extracting the actual payload bytes as necessary 
+ *   3. Embed a call to the 'decoder' function within the platform's 'payloader decoder'
+ *      main function call, extracting the actual payload bytes as necessary
  *      and passing them to decoder(bytes, map, platform).
  */
 
@@ -82,12 +82,12 @@ function ERROR(msg) {
  * bitfield
  * name
  * fixed_array
- * 
- * 
+ *
+ *
  * Decoders accept a byte buffer, a bit index, an array to push decoded output data to which
  * is eventually passed to the user's decoder processor function, and an optional object
  * of arguments.
- * 
+ *
  * Decoders return number of bits consumed, or -1 on decoder error.
  * */
 
@@ -250,7 +250,7 @@ function uint32_decoder(buf, bit_index, out) {
 
 
 function array_decoder(buf, bit_index, out, args) {
-    
+
 }
 
 /* Extracts the required number of bytes and returns them as a subarray
@@ -370,9 +370,7 @@ var time_decoder = [
 ]
 
 var devstartup_decoder = [
-    { fn: uint8_decoder, name: 'fw_ver_major' }, 
-    { fn: uint16_decoder, name: 'fw_ver_minor' },
-    { fn: uint8_decoder, name: 'fw_ver_patch' },
+    { fn: dynamic_bytearray_decoder, name: 'fw_ver' },
     { fn: uint16_decoder, name: 'reset_flags' }
 ]
 
@@ -416,22 +414,22 @@ var antelope_tapos_decoder = [
 
 /* The transaction re-assembler can be built as a 'platform'.  A reference implementation
  * is provided in decoder-antelope.js
- * 
+ *
  * The message content handled by fixed_array_decoders can be inserted directly
  * into the re-assembled transaction.
  */
 
 var antelope_message_header_decoder = [
     /*
-     * bits 0-2: a transaction ID (0-7) to aid in element re-assembly 
+     * bits 0-2: a transaction ID (0-7) to aid in element re-assembly
      *   Only transaction elements marked with the same trx ID can be reassembled together.
-     * bits 3-5: 
-     * 
+     * bits 3-5:
+     *
      * */
-    { fn: uint8_decoder, name: 'flags' } 
+    { fn: uint8_decoder, name: 'flags' }
 ]
 
-/* The Measurement{Earth} Trusted Sensor Platform modules signs with 
+/* The Measurement{Earth} Trusted Sensor Platform modules signs with
  *  max_net, max_cpu and delay_sec set to 0.
  */
 var antelope_message_tapos_decoder = [
@@ -504,7 +502,7 @@ function decoder_run(buf, bit_index, out, decoder) {
             }
         } else {
             /* run decoder now */
-            if (field_decoder.fn) {                
+            if (field_decoder.fn) {
 //                TRACE(field_decoder.fn.name + ' decoding at bit_index ' + (bit_index + decoded_bits) + ' ' + field_decoder.name)
                 TRACE('decoding ' + (field_decoder.name ? field_decoder.name : '') + ' with ' + field_decoder.fn.name + ' at bit_index ' + (bit_index + decoded_bits))
                 var res = field_decoder.fn(buf, bit_index + decoded_bits, out, field_decoder.args)
@@ -521,7 +519,7 @@ function decoder_run(buf, bit_index, out, decoder) {
 
 
 /* Decoder engine
- * 
+ *
  *   Accepts array of bytes, a channel map and a platform object.
  *   The output from each data type decoder is a naturalized data format,
  *   e.g. temperature bitfield decoder returns a floating-point temperature value.
@@ -635,6 +633,6 @@ module.exports = {
     antelope_message_signature_decoder,
     antelope_message_tapos_req_decoder,
 
-    
+
 }
 

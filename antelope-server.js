@@ -40,7 +40,6 @@ const fs = require('fs')
 const path = require('path')
 //const http = require('http')
 
-
 /* Setup server based on passed-in arguments:
  *   arg1: network interface name to search for ipv4 address, or if not found, ip-address to listen on
  *   arg2: server's port
@@ -145,7 +144,7 @@ function dispatch_tapos(tapos_req, tapos, time_ms, path, res) {
 
     let data = {
         "payload_raw": tbuf.toString('base64'),
-        "port": ELPP_PORT_LORAWAN,
+        "port": ELPP_PORT_EOS_LORAWAN,
         "confirmed": false
     }
 
@@ -393,16 +392,17 @@ function get_device_state(key) {
     return state
 }
 
-/* This arbitrarily assigned port is used for ELPP protocol on LORAWAN. */
-const ELPP_PORT_LORAWAN           = 8
+/* This assigned port is used for Antelope ELPP protocol messages on LORAWAN.
+The channel map associated with this port is fixed on both ends of the link and MUST NOT CHANGE. */
+const ELPP_PORT_EOS_LORAWAN             = 8
 
 function decodeHelium(data, res) {
     log('Decode Helium')
 
     /* Expect key: 'port' */
-    if (1 && data.port != ELPP_PORT_LORAWAN) {
+    if (1 && data.port != ELPP_PORT_EOS_LORAWAN) {
         res.writeHead(500)
-        let msg = 'Unsupported port: ' + data.port + '. Expect data on port ' + ELPP_PORT_LORAWAN + ' for ELPP.'
+        let msg = 'Unsupported port: ' + data.port + '. Expect data on port ' + ELPP_PORT_EOS_LORAWAN + ' for ELPP.'
         res.end(msg)
         log(msg)
         return

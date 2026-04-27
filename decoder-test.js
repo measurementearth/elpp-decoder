@@ -46,6 +46,20 @@ function accel_processor(out, data) {
     }
 }
 
+function devstartup_processor(out, data) {
+    /* 'data' is a namespace for the processor to write into; it will be post-processed and returned by the platform */
+    /* out is the decoded data items as an array:
+      0 : decoded varuint32 field (array length of firmware version digits)
+      1 : decoded array bytes of firmware version digits
+      2 : reset flags
+    */
+    ver_digits = out[0]
+    data['devstartup'] = {
+        'fw_ver' : 'v' + out[1].map(x => x.toString()).join('.'),
+        'reset_flags' : '0x' + out[2].toString(16)
+    }
+}
+
 /* The channel map defines the application's mapping of channels to data type decoders.
  * The data type decoders form a root of a possibly heirarch of decoders and primitive decoders.
  * A processor function is required to convert the output into something the cloud platform can
@@ -56,9 +70,10 @@ function accel_processor(out, data) {
 
 var channel_map = {
     0: { decoder: elpp.temperature_decoder, processor: temp_processor },
-    1: { decoder: elpp.pm_decoder, processor: pm_processor },
+    1: { decoder: elpp.particle_decoder, processor: pm_processor },
     2: { decoder: elpp.accel_decoder, processor: accel_processor },
-    10: { decoder: elpp.time_decoder, processor: time_processor }
+    10: { decoder: elpp.time_decoder, processor: time_processor },
+    30: { decoder: elpp.devstartup_decoder, processor: devstartup_processor }
 }
 
 var platform = {
@@ -99,14 +114,25 @@ function accel_provider() {
     return [12,-1234,12345678]
 }
 
-var encoder_map = {
-    0: { encoder: encoder.temperature_encoder, provider: temperature_provider },
-    1: { encoder: encoder.pm_encoder, provider: pm_provider },
-    2: { encoder: encoder.accel_encoder, provider: accel_provider },
-    10: {encoder : encoder.time_encoder, provider: time_provider}
+function devstartup_provider() {
+    /* encoding an array of version digits, and a uint16 reset flags */
+    var data = [
+        [2,1,6,5], /* v2.1.6-5 */
+        0xAF03
+    ]
+    return data
 }
 
-var test_vec = encoder.encoder([10, 0, 1, 2], encoder_map)
+var encoder_map = {
+    0: { encoder: encoder.temperature_encoder, provider: temperature_provider },
+    1: { encoder: encoder.particle_encoder, provider: pm_provider },
+    2: { encoder: encoder.accel_encoder, provider: accel_provider },
+    10: {encoder: encoder.time_encoder, provider: time_provider},
+    30: {encoder: encoder.devstartup_encoder, provider: devstartup_provider }
+}
+
+/* vector is a list of channel numbers to encode, in order. */
+var test_vec = encoder.encoder([10, 0, 1, 2, 30], encoder_map)
 
 log('== encoded ==')
 log(Buffer.from(test_vec).toString('hex'))

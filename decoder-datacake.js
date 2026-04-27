@@ -34,11 +34,11 @@ SOFTWARE.
  *    },
  *    ...
  *  ]
- *  
+ *
  * To use the ELPP decoder protocol, one must implement a platform object 'pre_process' and 'post_process'
  * to set and return this array, and then implement a decoder processor for each decoder type that is in use
  * on the platform.
- * 
+ *
  * This file contains the implementions of these functions.  What you need to do is copy and paste these
  * into the device configuration's Decoder section and modify the '_processor' functions to use the
  * database names you've chosen to store the values for your configuration.
@@ -56,12 +56,13 @@ function TRACE(msg) {
     }
 }
 
-/* This arbitrarily assigned port is used for ELPP protocol on LORAWAN. */
-var ELPP_PORT_LORAWAN = 8
+/* This assigned port is used for Standard ELPP protocol messages on LORAWAN.
+The channel map associated with this port is fixed on both ends of the link and MUST NOT CHANGE. */
+var ELPP_PORT_LORAWAN = 9
 
 /* State:
  *    timestamp - record time as it is found in the decoded output to be applied to subsequent data items.
- *    serial - extracted from the data provided by Datacake in a link-dependent way. 
+ *    serial - extracted from the data provided by Datacake in a link-dependent way.
  *
  */
 var timestamp
@@ -278,7 +279,7 @@ function decoder_webhook_senet(request) {
 
     /*
      * How to use:
-     * 
+     *
      * function Decoder(request) {
      *     return decoder_webhook_senet(request)
      * }
@@ -348,8 +349,8 @@ var test_vec = encoder.encoder([10, 0, 11], encoder_map)
 
 
 /* Extract serial number from the input to the Decoder function.
- * Only necessary if coming from an API endpoint.  Datacake automatically extracts the serial number from the DevEUI 
- * supplied by supported LoRaWAN endpoints 
+ * Only necessary if coming from an API endpoint.  Datacake automatically extracts the serial number from the DevEUI
+ * supplied by supported LoRaWAN endpoints
  */
 serial = '0123456789'
 

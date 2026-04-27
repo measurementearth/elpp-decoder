@@ -247,6 +247,17 @@ var battery_encoder = [
     temperature_encoder
 ]
 
+/*--- System encoders -----------------------------------*/
+
+/* fw_ver 2.1.4.2, reset flags
+Note: maximum size will be constrained by smallest uplink payload size of the transport,
+which is 11 bytes for LoRaWAN (SF10 in NA)
+*/
+var devstartup_encoder = [
+    /* Each byte is a digit; byte[0] is major, etc. Typically 3, possibly 4 digits */
+    { fn: dynamic_bytearray_encoder, name: 'fw_ver' },
+    { fn: uint16_encoder, name: 'reset_flags' }
+]
 
 /*--- Antelope protocol encoders -----------------------------*/
 
@@ -262,9 +273,9 @@ var antelope_tapos_encoder = [
 
 var antelope_message_header_encoder = [
     /*
-     * bits 0-2: a transaction ID (0-7) to aid in element re-assembly 
+     * bits 0-2: a transaction ID (0-7) to aid in element re-assembly
      *   Only transaction elements marked with the same trx ID can be reassembled together.
-     * 
+     *
      * */
     { fn: uint8_encoder, name: 'flags' }
 ]
@@ -350,7 +361,7 @@ function encoder_run(buf, bit_index, encoder, provider) {
 
 /* This encoder gets the input data from the 'providers' assigned to each channel in the map,
  * which must return an array of values that are consumed by each primitive encoder composing the type.
- * 
+ *
  * The order of encoding is defined by the list of channel numbers.
  */
 function encoder(channel_list, encoder_map) {
@@ -404,6 +415,7 @@ module.exports = {
     particle_encoder,
     accel_encoder,
     time_encoder,
+    devstartup_encoder,
 
     /* Antelope */
     antelope_message_header_encoder,
