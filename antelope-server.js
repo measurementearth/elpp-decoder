@@ -207,12 +207,20 @@ function remove_trx(chain_q, chain_q_index) {
  * 'res' will be available to possibly return the result of the blockchain API call.
  * This can also be called as a retry in which case 'res' will be null.
  */
-function dispatch_trx(json, host, res, chain_q, chain_q_index) {
+/* dispatch_trx: send a transaction to the given API endpoint.
+ * On HTTP 200 success the trx is removed from the queue.
+ * On any failure the trx is left in the queue (started=false) so it can be retried.
+ * Returns true if the request was initiated (does not mean it succeeded).
+ */
+function dispatch_trx(json, api, res, chain_q, chain_q_index) {
+
+    const use_https = api.method === 'https://'
+    const transport = use_https ? https : http
 
     // An object of options to indicate where to post to
     var post_options = {
-        host: host,
-        port: '80',
+        host: api.host,
+        port: use_https ? '443' : '80',
         path: '/v1/chain/send_transaction',
         method: 'POST',
         headers: {
@@ -221,8 +229,11 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
         }
     };
 
+    /* Mark in-flight so manage_dispatch_queues won't re-dispatch while pending */
+    chain_q[chain_q_index].started = true
+
     /* Set up and execute the request */
-    var post_req = http.request(post_options, function (hres) {
+    var post_req = transport.request(post_options, function (hres) {
         hres.setEncoding('utf8')
         let data = ''
         hres.on('data', function (chunk) {
@@ -230,43 +241,85 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
         })
         hres.on('end', () => {
             log(data)
-            if (res) {
-                log('response ' + hres.statusCode)
-                res.statusCode = hres.statusCode
-                res.end(data)
-            }
-
-            /* remove the trx whether it succeeded or not (assuming that sending it again will not change the situation) */
-            if (1 /* res.statusCode == 200 */) {
+            if (hres.statusCode >= 200 && hres.statusCode < 300) {
+                log('trx dispatch success (' + hres.statusCode + ') via ' + api.host)
+                if (res) {
+                    res.statusCode = hres.statusCode
+                    res.end(data)
+                }
+                /* Only remove on confirmed success */
                 remove_trx(chain_q, chain_q_index)
-            }
+            } else {
+                /* Check if the error is unrecoverable — if so, drop the trx immediately */
+                let drop = false
+                try {
+                    let errBody = JSON.parse(data)
+                    if (errBody && errBody.error && TRX_UNRECOVERABLE_ERROR_CODES.has(errBody.error.code)) {
+                        log('trx unrecoverable error ' + errBody.error.code + ' (' + (errBody.error.name || '?') + ') via ' + api.host + ', dropping trx')
+                        drop = true
+                    }
+                } catch (_) {}
 
+                if (res) {
+                    res.statusCode = hres.statusCode
+                    res.end(data)
+                }
+
+                if (drop) {
+                    if (chain_q[chain_q_index]) {
+                        /* Increment unrecoverable drop counters for the correct chain */
+                        let chain_key = chain_q[chain_q_index].chain_key
+                        let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
+                        if (cstats) {
+                            cstats.trx_dropped_total++
+                            cstats.trx_dropped_unrecoverable++
+                            try {
+                                let errBody = JSON.parse(data)
+                                let code = errBody.error.code
+                                cstats.unrecoverable_errors[code] = (cstats.unrecoverable_errors[code] || 0) + 1
+                            } catch (_) {}
+                        }
+                        remove_trx(chain_q, chain_q_index)
+                    }
+                } else {
+                    api.errors++;
+                    log('trx dispatch failed (' + hres.statusCode + ') via ' + api.host + ', will retry')
+                    /* Reset so it can be retried via another AP */
+                    if (chain_q[chain_q_index]) {
+                        chain_q[chain_q_index].started = false
+                    }
+                }
+            }
         })
         hres.on('error', (err) => {
-            log('POST xfer error: ' + err.message)
+            api.errors++;
+            log('POST xfer error via ' + api.host + ': ' + err.message)
             if (res) {
                 res.statusCode = 500
                 res.end('POST xfer error: ' + err.message)
             }
-            if (1 /* res.statusCode == 200 */) {
-                remove_trx(chain_q, chain_q_index)
+            /* Reset so it can be retried */
+            if (chain_q[chain_q_index]) {
+                chain_q[chain_q_index].started = false
             }
         })
     })
 
-    /* Ideally if timeouts can be differentiated from other errors - this is when we would want to try again */
+    /* Network-level error: leave trx in queue for retry */
     post_req.on('error', (err) => {
-        log('POST error: ' + err.message)
+        api.errors++;
+        log('POST error via ' + api.host + ': ' + err.message)
         if (res) {
             res.statusCode = 500
             res.end('POST error: ' + err.message)
         }
-        if (1 /* res.statusCode == 200 */) {
-            remove_trx(chain_q, chain_q_index)
+        /* Reset so it can be retried */
+        if (chain_q[chain_q_index]) {
+            chain_q[chain_q_index].started = false
         }
     })
 
-    log('write request: ')
+    log('write request to ' + api.method + api.host + ':')
     log_obj(post_options)
 
     // post the data
@@ -276,27 +329,32 @@ function dispatch_trx(json, host, res, chain_q, chain_q_index) {
 }
 
 
-/* Try to send transactions pending in each chain's dispatch queue */
+/* Try to send transactions pending in each chain's dispatch queue.
+ * For each queued trx that is not in-flight, try every valid AP in the pool
+ * until one accepts the dispatch (started=true while in-flight).
+ * The trx is only removed from the queue on HTTP 200 success (inside dispatch_trx).
+ */
 function manage_dispatch_queues(res) {
     log('manage dispatch queues')
-    for (c in tapos_manager_state) {
+    for (let c in tapos_manager_state) {
         let state = tapos_manager_state[c]
         let chain_q = state.dispatch_queue
         log('checking chain state ' + c + ', queue has ' + chain_q.length + ' items')
-        /* for each chain, see what is not started and start them. */
-        for (t in chain_q) {
-            log('checking trx ' + t)
+        for (let t = 0; t < chain_q.length; t++) {
             let trx = chain_q[t]
+            log('checking trx ' + t + ' started=' + trx.started)
             if (!trx.started) {
-                /* Use the last API that successfully acquire TAPOS */
-                if (state.api_last) {
-                    log("dispatching pending trx for '" + trx.key + "' at index " + t + " to '" + state.api_last.host + "'")
-                    state.api_last.trx_count++;
-                    dispatch_trx(trx.json, state.api_last.host, res, chain_q, t)
-                    trx.started = true
-                }
-                else {
-                    log('warning: no available dispatch API')
+                /* Collect all valid APs, pick one at random, then try the rest in order on failure */
+                let valid_aps = state.api_pool.filter(a => a.valid)
+                if (valid_aps.length > 0) {
+                    /* Shuffle: pick a random starting index */
+                    let start = Math.floor(Math.random() * valid_aps.length)
+                    let api = valid_aps[start]
+                    log("dispatching pending trx for '" + trx.key + "' at index " + t + " to '" + api.host + "' (randomly selected from " + valid_aps.length + " valid APs)")
+                    api.trx_count++
+                    dispatch_trx(trx.json, api, res, chain_q, t)
+                } else {
+                    log('warning: no valid AP available for dispatch')
                 }
             }
         }
@@ -312,12 +370,14 @@ function push_trx(trx, state, res) {
         /* Move it to the dispatcher queue for the chain */
         let dispatch_queue = dispatch_get(trx.chain)
         if (dispatch_queue) {
-            log('posting trx to chain ' + trx.chain + ' dispatch queue at ' + dispatch_queue.length)
+            let chain_key = CHAIN_KEY_FROM_ID[trx.chain] || null
+            log('posting trx to chain ' + trx.chain + ' (' + chain_key + ') dispatch queue at ' + dispatch_queue.length)
             dispatch_queue.push({
                 epoch: epoch,
                 started: false,
                 json: trx.json,
-                key: state.key /* propagate device key  */
+                key: state.key,       /* propagate device key */
+                chain_key: chain_key  /* propagate chain key for per-chain stats */
             })
 
             state.trx_count++
@@ -524,6 +584,46 @@ const dashboardListener = function (req, res) {
         return
     }
 
+    if (reqPath === '/api/tapos_refresh') {
+        /* Immediately check ALL APs across ALL chains in parallel, then return updated ap_status */
+        log('Dashboard: immediate TAPOS refresh requested for all APs')
+        tapos_refresh_all().then(() => {
+            let summary = tapos_ap_status_summary()
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify(summary))
+        }).catch(err => {
+            res.writeHead(500, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: String(err) }))
+        })
+        return
+    }
+
+    if (reqPath === '/api/server_stats') {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(server_stats))
+        return
+    }
+
+    if (reqPath === '/api/ap_status') {
+        /* Return a clean per-AP status summary for the dashboard */
+        let summary = {}
+        for (let c in tapos_manager_state) {
+            let state = tapos_manager_state[c]
+            summary[c] = state.api_pool.map(api => ({
+                host: api.host,
+                method: api.method,
+                valid: api.valid,
+                errors: api.errors,
+                use_count: api.use_count,
+                trx_count: api.trx_count,
+                version_found: api.version_found
+            }))
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(summary))
+        return
+    }
+
     if (reqPath === '/dashboard' || reqPath.startsWith('/dashboard/')) {
         let relPath = reqPath === '/dashboard' ? '/index.html' : reqPath.replace('/dashboard', '')
         let filePath = path.join(__dirname, 'dashboard', relPath)
@@ -580,6 +680,34 @@ if (1) {
 const TAPOS_MANAGER_API_ERRORS_MAX = 5
 const TAPOS_MANAGER_API_CHECK_MAX = 10
 
+/* Per-chain statistics helper — returns a fresh stats object */
+function make_chain_stats() {
+    return {
+        trx_dropped_total: 0,           /* total trx forcibly removed from queue without success */
+        trx_dropped_unrecoverable: 0,   /* dropped due to a known unrecoverable Antelope error code */
+        trx_dropped_other: 0,           /* dropped for other reasons (e.g. age/timeout expiry) */
+        unrecoverable_errors: {}        /* per-error-code hit counts, e.g. { 3040007: 5 } */
+    }
+}
+
+/* Global server statistics — one entry per chain, keyed by chain name */
+const server_stats = {
+    [KEY_TELOS_TESTNET]: make_chain_stats(),
+    [KEY_TELOS_MAINNET]: make_chain_stats()
+}
+
+/* Antelope error codes that indicate the transaction itself is permanently invalid.
+ * Retrying against a different AP will not help — drop the trx immediately on these.
+ * Reference: https://github.com/AntelopeIO/leap/blob/main/libraries/chain/include/eosio/chain/exceptions.hpp
+ */
+const TRX_UNRECOVERABLE_ERROR_CODES = new Set([
+    3040005,  // expired_tx_exception         — transaction has already expired
+    3040006,  // tx_exp_too_far_exception     — expiration too far in the future
+    3040007,  // invalid_ref_block_exception  — TAPOS ref block not found in chain
+    3040008,  // tx_duplicate                 — duplicate transaction already in chain
+    3040009,  // tx_duplicate_deferred        — duplicate transaction already in chain
+])
+
 var tapos_manager_state = {
     [KEY_TELOS_TESTNET]: {
         name : KEY_TELOS_TESTNET,
@@ -590,9 +718,14 @@ var tapos_manager_state = {
             ref_block_prefix : 0
         },
         api_pool : [
-            { method: 'http://', host: 'telostestnet.greymass.com', errors: 0, check_count: 0, use_count : 0, trx_count: 0, version_found : ''  },
-            { method: 'http://', host: 'telostest.api.eosnation.io', errors: 0, check_count: 0, use_count : 0, trx_count : 0, version_found : ''  }
+            { method: 'https://', host: 'telostestnet.greymass.com',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'testnet.telos.caleos.io',         valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'telos-testnet.eosphere.io',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'telos-testnet.cryptolions.io',    valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'api.testnet.telosunlimited.com',  valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' }
+
         ],
+        pool_index : 0, /* round-robin index for TAPOS health checks */
         api_last : null, /* last API successfully used to acquire TAPOS */
         dispatch_queue : []
     },
@@ -605,9 +738,14 @@ var tapos_manager_state = {
             ref_block_prefix: 0
         },
         api_pool: [
-            { method: 'http://', host: 'telos.greymass.com', errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found : '' },
-            { method: 'http://', host: 'telos.api.eosnation.io', errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found : ''  }
+            { method: 'https://', host: 'telos.greymass.com',         valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'telos.caleos.io',            valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'telos.eosphere.io',          valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'telos.eosrio.io',            valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'telos.cryptolions.io',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            { method: 'https://', host: 'api.telosunlimited.com',     valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' }
         ],
+        pool_index : 0, /* round-robin index for TAPOS health checks */
         api_last : null, /* last API successfully used to acquire TAPOS */
         dispatch_queue : []
     }
@@ -681,30 +819,103 @@ for (key in tapos_manager_state) {
 
 
 
-function tapos_manager_select_pool(state) {
-    /* Do some housekeeping first:
-     * slowly decrease errors to allow trying again */
-    for (i in state.api_pool) {
-        let api = state.api_pool[i]
-        if (api.errors >= TAPOS_MANAGER_API_ERRORS_MAX) {
-            if (++api.check_count == TAPOS_MANAGER_API_CHECK_MAX) {
-                api.errors--
-                api.check_count = 0
-            }
+/* Build the AP status summary object used by /api/ap_status and /api/tapos_refresh */
+function tapos_ap_status_summary() {
+    let summary = {}
+    for (let c in tapos_manager_state) {
+        let state = tapos_manager_state[c]
+        summary[c] = state.api_pool.map(api => ({
+            host: api.host,
+            method: api.method,
+            valid: api.valid,
+            errors: api.errors,
+            use_count: api.use_count,
+            trx_count: api.trx_count,
+            version_found: api.version_found
+        }))
+    }
+    return summary
+}
+
+/* Check a single AP and update its state. Returns a Promise that always resolves (never rejects). */
+function tapos_check_ap(state, api) {
+    return new Promise(resolve => {
+        const use_https = api.method === 'https://'
+        const transport = use_https ? https : http
+        const url = api.method + api.host + '/v1/chain/get_info'
+
+        log("tapos_refresh: checking '" + api.host + "'")
+        api.use_count++
+
+        transport.get(url, response => {
+            let info = ''
+            response.on('data', chunk => { info += chunk })
+            response.on('end', () => {
+                try {
+                    let json = JSON.parse(info)
+                    const ref_block_num = json.last_irreversible_block_num & 0xFFFF
+                    const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex')
+                    const ref_block_prefix = last_irr_block_id.readUInt32LE(8)
+                    const hash = json.chain_id
+                    if (hash !== state.hash) {
+                        throw new Error("chain hash mismatch for '" + api.host + "'")
+                    }
+                    state.tapos.acq_time_epoch = Date.now() / 1000 >> 0
+                    state.tapos.ref_block_num = ref_block_num
+                    state.tapos.ref_block_prefix = ref_block_prefix
+                    api.version_found = json.server_version_string
+                    api.valid = true
+                    //if (api.errors > 0) api.errors--
+                    state.api_last = api
+                    log("tapos_refresh: '" + api.host + "' valid, version=" + api.version_found)
+                } catch (e) {
+                    api.valid = false
+                    api.errors++
+                    log("tapos_refresh: '" + api.host + "' invalid: " + (e.message || e))
+                }
+                resolve()
+            })
+            response.on('error', err => {
+                api.valid = false
+                api.errors++
+                log("tapos_refresh: '" + api.host + "' error: " + (err.message || err))
+                resolve()
+            })
+        }).on('error', err => {
+            api.valid = false
+            api.errors++
+            log("tapos_refresh: '" + api.host + "' error: " + (err.message || err))
+            resolve()
+        })
+    })
+}
+
+/* Check ALL APs across ALL chains in parallel. Returns a Promise that resolves when all are done. */
+function tapos_refresh_all() {
+    let promises = []
+    for (let c in tapos_manager_state) {
+        let state = tapos_manager_state[c]
+        for (let i = 0; i < state.api_pool.length; i++) {
+            promises.push(tapos_check_ap(state, state.api_pool[i]))
         }
     }
+    return Promise.all(promises)
+}
 
-    let attempts = 10
-    let api = null
-    do {
-        let index = Math.floor(Math.random() * state.api_pool.length)
-        api = state.api_pool[index]
-    } while (--attempts && api.errors >= TAPOS_MANAGER_API_ERRORS_MAX)
+/* Round-robin: select the next AP in the pool to health-check.
+ * Advances pool_index each call so every AP is checked in turn each cycle.
+ */
+function tapos_manager_select_pool(state) {
+    let pool = state.api_pool
+    if (!pool || pool.length === 0) return null
 
-    if (api) {
-        api.use_count++;
-        log("TAPOS Manager: selected api '" + api.host + "' uses " + api.use_count + ' errors ' + api.errors + '  check_count ' + api.check_count)
-    }
+    /* Advance round-robin index */
+    let index = state.pool_index % pool.length
+    state.pool_index = (index + 1) % pool.length
+
+    let api = pool[index]
+    api.use_count++
+    log("TAPOS Manager: checking api '" + api.host + "' (index " + index + ') uses ' + api.use_count + ' errors ' + api.errors)
     return api
 }
 
@@ -713,78 +924,93 @@ function tapos_manager_error(msg, state, api, timeout) {
 
     if (api) {
         api.errors++
+        api.valid = false
+        log("TAPOS Manager: marked '" + api.host + "' invalid (errors=" + api.errors + ')')
     }
 
     clearTimeout(timeout)
-    /* want to try again quickly */
-    setTimeout(tapos_manager_run, tapos_manager_next_run(state.name, true), state)
+    /* Schedule next check — use fast retry only if ALL APs are invalid */
+    let anyValid = state.api_pool.some(a => a.valid)
+    setTimeout(tapos_manager_run, tapos_manager_next_run(state.name, !anyValid), state)
 }
 
-function tapos_manager_finish(msg, state, api, timeout) {
+function tapos_manager_finish(state, api) {
     if (api) {
-        /* decrement the error counter on a succesful poll */
-        if (api.errors > 0) {
-            api.errors--
-        }
-        /* set/update the last successfully used API */
+        // /* Decrement error counter on a successful poll */
+        // if (api.errors > 0) {
+        //     api.errors--
+        // }
+        /* Mark this AP as valid and record it as the last successful AP */
+        api.valid = true
         state.api_last = api
+        log("TAPOS Manager: marked '" + api.host + "' valid")
     }
 }
 
+/* tapos_manager_run: called periodically for each chain.
+ * Checks one AP per invocation (round-robin).  Each AP is independently
+ * marked valid/invalid based on whether TAPOS can be acquired from it.
+ * The next run is scheduled unconditionally so all APs are polled over time.
+ */
 function tapos_manager_run(state) {
+    /* Schedule the next check for this chain regardless of outcome */
     let timeout = setTimeout(tapos_manager_run, tapos_manager_next_run(state.name), state)
 
     let api = tapos_manager_select_pool(state)
-    if (api) {
-        let url = api.method + api.host + '/v1/chain/get_info'
-        http.get(url, response => {
-            let info = ''
-            response.on('data', chunk => {
-                info += chunk
-            })
-            response.on('end', () => {
-                try {
-                    let json = JSON.parse(info)
+    if (!api) {
+        log('TAPOS Manager: no APs in pool for ' + state.name)
+        return
+    }
 
-                    /* Interestingly, the ref_block_prefix is, converted to hex, embedded in the same
-                     * block ID at the 8th byte position in reversed byte order. Which means we can get the
-                     * prefix right from the block id in the get_info request without making an additional request to get_block.
-                     */
-                    const ref_block_num = json.last_irreversible_block_num & 0xFFFF;
-                    const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex');
-                    const ref_block_prefix = last_irr_block_id.readUInt32LE(8);
-                    const hash = json.chain_id
-                    if (hash !== state.hash) {
-                        throw new Error("chain hash mismatch for '" + api.host + "', found '" + hash + "', require '" + state.hash + "'")
-                    }
+    const use_https = api.method === 'https://'
+    const transport = use_https ? https : http
+    let url = api.method + api.host + '/v1/chain/get_info'
 
-                    state.tapos.acq_time_epoch = Date().now / 1000 >> 0
-                    state.tapos.ref_block_num = ref_block_num
-                    state.tapos.ref_block_prefix = ref_block_prefix
+    transport.get(url, response => {
+        let info = ''
+        response.on('data', chunk => {
+            info += chunk
+        })
+        response.on('end', () => {
+            try {
+                let json = JSON.parse(info)
 
-                    api.version_found = json.server_version_string
-
-                    log("Aquired TAPOS at " + (new Date(state.tapos.acq_time_epoch)).toISOString() + " for '" + state.name + "' from '" + url + "' '" + api.version_found + "' ref_block_num: " + state.tapos.ref_block_num.toString(16) + ' prefix: ' + state.tapos.ref_block_prefix.toString(16))
-
-                    tapos_manager_finish('success', state, api, timeout)
-
-                } catch (e) {
-                    let msg = ((e && ('message' in e)) ? e.message : 'unknown')
-                    tapos_manager_error(msg, state, api, timeout)
+                /* Interestingly, the ref_block_prefix is, converted to hex, embedded in the same
+                 * block ID at the 8th byte position in reversed byte order. Which means we can get the
+                 * prefix right from the block id in the get_info request without making an additional request to get_block.
+                 */
+                const ref_block_num = json.last_irreversible_block_num & 0xFFFF;
+                const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex');
+                const ref_block_prefix = last_irr_block_id.readUInt32LE(8);
+                const hash = json.chain_id
+                if (hash !== state.hash) {
+                    throw new Error("chain hash mismatch for '" + api.host + "', found '" + hash + "', require '" + state.hash + "'")
                 }
 
-            })
-            response.on('error', err => {
-                let msg = err
+                state.tapos.acq_time_epoch = Date.now() / 1000 >> 0
+                state.tapos.ref_block_num = ref_block_num
+                state.tapos.ref_block_prefix = ref_block_prefix
+
+                api.version_found = json.server_version_string
+
+                log("Acquired TAPOS at " + (new Date(state.tapos.acq_time_epoch * 1000)).toISOString() + " for '" + state.name + "' from '" + url + "' '" + api.version_found + "' ref_block_num: " + state.tapos.ref_block_num.toString(16) + ' prefix: ' + state.tapos.ref_block_prefix.toString(16))
+
+                tapos_manager_finish(state, api)
+
+                /* Attempt to dispatch any queued transactions now that we have a valid AP */
+                manage_dispatch_queues(null)
+
+            } catch (e) {
+                let msg = ((e && ('message' in e)) ? e.message : 'unknown')
                 tapos_manager_error(msg, state, api, timeout)
-            })
-        }).on('error', err => {
-            let msg = err
-            tapos_manager_error(msg, state, api, timeout)
+            }
         })
-    } else {
-        tapos_manager_error(msg, state, api, timeout)
-    }
+        response.on('error', err => {
+            tapos_manager_error(err.message || err, state, api, timeout)
+        })
+    }).on('error', err => {
+        tapos_manager_error(err.message || err, state, api, timeout)
+    })
 }
 
 
