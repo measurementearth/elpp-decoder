@@ -282,40 +282,67 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
                         remove_trx(chain_q, chain_q_index)
                     }
                 } else {
-                    api.errors++;
-                    log('trx dispatch failed (' + hres.statusCode + ') via ' + api.host + ', will retry')
-                    /* Reset so it can be retried via another AP */
+                    api.errors++
                     if (chain_q[chain_q_index]) {
-                        chain_q[chain_q_index].started = false
+                        chain_q[chain_q_index].attempts++
+                        let attempts = chain_q[chain_q_index].attempts
+                        if (attempts >= TRX_MAX_ATTEMPTS) {
+                            log('trx dispatch failed (' + hres.statusCode + ') via ' + api.host + ', max attempts (' + TRX_MAX_ATTEMPTS + ') reached, dropping')
+                            let chain_key = chain_q[chain_q_index].chain_key
+                            let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
+                            if (cstats) { cstats.trx_dropped_total++; cstats.trx_dropped_other++ }
+                            remove_trx(chain_q, chain_q_index)
+                        } else {
+                            log('trx dispatch failed (' + hres.statusCode + ') via ' + api.host + ', attempt ' + attempts + '/' + TRX_MAX_ATTEMPTS + ', will retry')
+                            chain_q[chain_q_index].started = false
+                        }
                     }
                 }
             }
         })
         hres.on('error', (err) => {
-            api.errors++;
+            api.errors++
             log('POST xfer error via ' + api.host + ': ' + err.message)
             if (res) {
                 res.statusCode = 500
                 res.end('POST xfer error: ' + err.message)
             }
-            /* Reset so it can be retried */
             if (chain_q[chain_q_index]) {
-                chain_q[chain_q_index].started = false
+                chain_q[chain_q_index].attempts++
+                let attempts = chain_q[chain_q_index].attempts
+                if (attempts >= TRX_MAX_ATTEMPTS) {
+                    log('trx xfer error, max attempts (' + TRX_MAX_ATTEMPTS + ') reached, dropping')
+                    let chain_key = chain_q[chain_q_index].chain_key
+                    let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
+                    if (cstats) { cstats.trx_dropped_total++; cstats.trx_dropped_other++ }
+                    remove_trx(chain_q, chain_q_index)
+                } else {
+                    chain_q[chain_q_index].started = false
+                }
             }
         })
     })
 
-    /* Network-level error: leave trx in queue for retry */
+    /* Network-level error: leave trx in queue for retry (up to max attempts) */
     post_req.on('error', (err) => {
-        api.errors++;
+        api.errors++
         log('POST error via ' + api.host + ': ' + err.message)
         if (res) {
             res.statusCode = 500
             res.end('POST error: ' + err.message)
         }
-        /* Reset so it can be retried */
         if (chain_q[chain_q_index]) {
-            chain_q[chain_q_index].started = false
+            chain_q[chain_q_index].attempts++
+            let attempts = chain_q[chain_q_index].attempts
+            if (attempts >= TRX_MAX_ATTEMPTS) {
+                log('trx POST error, max attempts (' + TRX_MAX_ATTEMPTS + ') reached, dropping')
+                let chain_key = chain_q[chain_q_index].chain_key
+                let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
+                if (cstats) { cstats.trx_dropped_total++; cstats.trx_dropped_other++ }
+                remove_trx(chain_q, chain_q_index)
+            } else {
+                chain_q[chain_q_index].started = false
+            }
         }
     })
 
@@ -375,6 +402,7 @@ function push_trx(trx, state, res) {
             dispatch_queue.push({
                 epoch: epoch,
                 started: false,
+                attempts: 0,          /* number of dispatch attempts made so far */
                 json: trx.json,
                 key: state.key,       /* propagate device key */
                 chain_key: chain_key  /* propagate chain key for per-chain stats */
@@ -696,17 +724,69 @@ const server_stats = {
     [KEY_TELOS_MAINNET]: make_chain_stats()
 }
 
+/* Maximum number of dispatch attempts before a retryable trx is dropped */
+const TRX_MAX_ATTEMPTS = 5
+
 /* Antelope error codes that indicate the transaction itself is permanently invalid.
  * Retrying against a different AP will not help — drop the trx immediately on these.
  * Reference: https://github.com/AntelopeIO/leap/blob/main/libraries/chain/include/eosio/chain/exceptions.hpp
  */
 const TRX_UNRECOVERABLE_ERROR_CODES = new Set([
-    3040005,  // expired_tx_exception         — transaction has already expired
-    3040006,  // tx_exp_too_far_exception     — expiration too far in the future
-    3040007,  // invalid_ref_block_exception  — TAPOS ref block not found in chain
-    3040008,  // tx_duplicate                 — duplicate transaction already in chain
-    3040009,  // tx_duplicate_deferred        — duplicate transaction already in chain
+    // ---------------------------------------------
+    // Transaction exceptions (304xxxx)
+    // ---------------------------------------------
+    3040000,  // transaction_exception
+    3040001,  // tx_decompression_error
+    3040002,  // tx_no_action
+    3040003,  // tx_no_auths
+    3040004,  // cfa_irrelevant_auth
+    3040005,  // expired_tx_exception
+    3040006,  // tx_exp_too_far_exception
+    3040007,  // invalid_ref_block_exception
+    3040008,  // tx_duplicate
+    3040009,  // deferred_tx_duplicate
+    3040010,  // cfa_inside_generated_tx
+    3040011,  // tx_not_found
+    3040012,  // too_many_tx_at_once
+    3040013,  // tx_too_big
+    3040014,  // unknown_transaction_compression
+    3040015,  // invalid_transaction_extension
+    3040016,  // ill_formed_deferred_transaction_generation_context
+    3040017,  // disallowed_transaction_extensions_bad_block_exception
+    3040018,  // tx_resource_exhaustion
+
+    // ---------------------------------------------
+    // Authorization exceptions (309xxxx)
+    // ---------------------------------------------
+    3090000,  // authorization_exception
+    3090001,  // tx_duplicate_sig
+    3090002,  // tx_irrelevant_sig
+    3090003,  // unsatisfied_authorization
+    3090004,  // missing_auth_exception
+    3090005,  // irrelevant_auth_exception
+    3090006,  // insufficient_delay_exception
+    3090007,  // invalid_permission
+    3090008,  // unlinkable_min_permission_action
+    3090009,  // invalid_parent_permission
+
+    // ---------------------------------------------
+    // Action validation exceptions (305xxxx)
+    // ---------------------------------------------
+    3050000,  // action_validate_exception
+    3050001,  // account_name_exists_exception
+    3050002,  // invalid_action_args_exception
+    3050003,  // eosio_assert_message_exception
+    3050004,  // eosio_assert_code_exception
+    3050005,  // action_not_found_exception
+    3050006,  // action_data_and_struct_mismatch
+    3050007,  // unaccessible_api
+    3050008,  // abort_called
+    3050009,  // inline_action_too_big
+    3050010,  // unauthorized_ram_usage_increase
+    3050011,  // restricted_error_code_exception
+    3050014,  // action_return_value_exception
 ])
+
 
 var tapos_manager_state = {
     [KEY_TELOS_TESTNET]: {
