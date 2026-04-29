@@ -58,6 +58,20 @@
 
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+      <strong>Dispatch TAPOS to Devices</strong>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="dispatchTaposTestnet" class="primary">⬇ Dispatch TAPOS → TELOS_TESTNET</button>
+      <button id="dispatchTaposMainnet" class="primary">⬇ Dispatch TAPOS → TELOS_MAINNET</button>
+      <span id="dispatchTaposStatus" style="font-size:12px;color:#556"></span>
+    </div>
+    <div id="dispatchTaposResult" style="margin-top:8px;font-size:12px"></div>
+  </div>
+
+  <div style="height:16px"></div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
       <strong>Access Point Status</strong>
       <div>
         <button id="refreshAPs" class="primary">⟳ Refresh All APs</button>

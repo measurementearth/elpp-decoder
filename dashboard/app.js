@@ -172,8 +172,40 @@ async function triggerApRefresh() {
   btn.disabled = false
 }
 
+async function dispatchTapos(chainKey) {
+  const btns = [el('dispatchTaposTestnet'), el('dispatchTaposMainnet')]
+  const status = el('dispatchTaposStatus')
+  const result = el('dispatchTaposResult')
+  btns.forEach(b => b.disabled = true)
+  status.innerText = 'Dispatching…'
+  result.innerText = ''
+  try {
+    const res = await fetch('/api/dispatch_tapos?chain=' + encodeURIComponent(chainKey), { cache: 'no-store' })
+    const data = await res.json()
+    if (data.error) {
+      status.innerText = 'Error: ' + data.error
+      result.innerText = ''
+    } else {
+      status.innerText = 'Done at ' + new Date().toLocaleTimeString()
+      let html = '<strong>' + chainKey + '</strong>: dispatched to ' + data.dispatched.length + ' device(s)'
+      if (data.dispatched.length > 0) {
+        html += ' [' + data.dispatched.join(', ') + ']'
+      }
+      if (data.skipped.length > 0) {
+        html += '<br>Skipped ' + data.skipped.length + ': ' + data.skipped.map(s => s.key + ' (' + s.error + ')').join(', ')
+      }
+      result.innerHTML = html
+    }
+  } catch (e) {
+    status.innerText = 'Error: ' + String(e)
+  }
+  btns.forEach(b => b.disabled = false)
+}
+
 el('refresh').addEventListener('click', refresh)
 el('refreshAPs').addEventListener('click', triggerApRefresh)
+el('dispatchTaposTestnet').addEventListener('click', () => dispatchTapos('TELOS_TESTNET'))
+el('dispatchTaposMainnet').addEventListener('click', () => dispatchTapos('TELOS_MAINNET'))
 
 refresh()
 refreshApStatus()

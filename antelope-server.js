@@ -265,6 +265,11 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
                     res.end(data)
                 }
 
+                /* record unable to send as an error associated with the AP, whether dropped or scheduled for retry */
+                api.errors++
+                let _dev1 = chain_q[chain_q_index] && device_states[chain_q[chain_q_index].key]
+                if (_dev1) _dev1.trx_errors++
+
                 if (drop) {
                     if (chain_q[chain_q_index]) {
                         /* Increment unrecoverable drop counters for the correct chain */
@@ -282,7 +287,7 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
                         remove_trx(chain_q, chain_q_index)
                     }
                 } else {
-                    api.errors++
+
                     if (chain_q[chain_q_index]) {
                         chain_q[chain_q_index].attempts++
                         let attempts = chain_q[chain_q_index].attempts
@@ -302,6 +307,8 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
         })
         hres.on('error', (err) => {
             api.errors++
+            let _dev2 = chain_q[chain_q_index] && device_states[chain_q[chain_q_index].key]
+            if (_dev2) _dev2.trx_errors++
             log('POST xfer error via ' + api.host + ': ' + err.message)
             if (res) {
                 res.statusCode = 500
@@ -326,6 +333,8 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
     /* Network-level error: leave trx in queue for retry (up to max attempts) */
     post_req.on('error', (err) => {
         api.errors++
+        let _dev3 = chain_q[chain_q_index] && device_states[chain_q[chain_q_index].key]
+        if (_dev3) _dev3.trx_errors++
         log('POST error via ' + api.host + ': ' + err.message)
         if (res) {
             res.statusCode = 500
@@ -472,6 +481,7 @@ function get_device_state(key) {
         state = device_states[key] = antelope.new_state()
         state.first_epoch = Date.now() / 1000 >> 0
         state.trx_count = 0
+        state.trx_errors = 0
     }
     /* Add a 'last used' epoch for possible garbage collection */
     state.last_epoch = Date.now() / 1000 >> 0
@@ -507,6 +517,9 @@ function decodeHelium(data, res) {
 
     let dresult = antelope.decoder(payload, state)
 
+    /* Record downlink URL for future forced dispatches (e.g. from dashboard) */
+    state.downlink_url = data.downlink_url
+
     /* Decoder result may have:
      *   trx : {} transaction
      *   tapos_req : request for TAPOS for specified chain
@@ -532,6 +545,15 @@ function decodeHelium(data, res) {
             let tapos = tapos_get(dresult.tapos_req.chain_id)
 
             if (tapos) {
+                state.last_tapos_dispatched = {
+                    chain_id: dresult.tapos_req.chain_id,
+                    req_id: dresult.tapos_req.req_id,
+                    ref_block_num: tapos.ref_block_num,
+                    ref_block_prefix: tapos.ref_block_prefix.toString(16),
+                    acq_time_epoch: tapos.acq_time_epoch,
+                    source_host: tapos.source_host || null,
+                    dispatch_epoch: Date.now() / 1000 >> 0
+                }
                 dispatch_tapos(dresult.tapos_req, tapos, gw_rx_time_ms, url.pathname, res)
             } else {
                 res.writeHead(500)
@@ -629,6 +651,58 @@ const dashboardListener = function (req, res) {
     if (reqPath === '/api/server_stats') {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(server_stats))
+        return
+    }
+
+    if (reqPath === '/api/dispatch_tapos') {
+        /* Dispatch current TAPOS to all devices on the specified chain that have a downlink URL.
+         * Query param: chain=TELOS_TESTNET or chain=TELOS_MAINNET
+         */
+        const params = new URLSearchParams(req.url.split('?')[1] || '')
+        const chain_key = params.get('chain')
+
+        /* Resolve chain_key to integer chain_id */
+        let chain_id = null
+        for (let id in CHAIN_KEY_FROM_ID) {
+            if (CHAIN_KEY_FROM_ID[id] === chain_key) { chain_id = parseInt(id); break }
+        }
+
+        if (chain_id === null || !(chain_key in tapos_manager_state)) {
+            res.writeHead(400, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'unknown or missing chain parameter' }))
+            return
+        }
+
+        let tapos = tapos_manager_state[chain_key].tapos
+        if (!tapos || tapos.ref_block_num === 0) {
+            res.writeHead(503, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'no valid TAPOS available for chain ' + chain_key }))
+            return
+        }
+
+        /* Find all devices that have communicated on this chain and have a downlink URL */
+        let dispatched = []
+        let skipped = []
+        for (let dev_key in device_states) {
+            let dev = device_states[dev_key]
+            if (dev.last_tapos_dispatched && dev.last_tapos_dispatched.chain_id === chain_id && dev.downlink_url) {
+                try {
+                    let url = new URL(dev.downlink_url)
+                    let tapos_req = { chain_id: chain_id, req_id: 0 }
+                    log('Dashboard: force-dispatching TAPOS to device ' + dev_key + ' on chain ' + chain_key)
+                    dispatch_tapos(tapos_req, tapos, 0, url.pathname, null)
+                    dispatched.push(dev_key)
+                } catch (e) {
+                    log('Dashboard: error dispatching TAPOS to device ' + dev_key + ': ' + e.message)
+                    skipped.push({ key: dev_key, error: e.message })
+                }
+            } else if (dev.last_tapos_dispatched && dev.last_tapos_dispatched.chain_id === chain_id) {
+                skipped.push({ key: dev_key, error: 'no downlink_url' })
+            }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ chain: chain_key, dispatched: dispatched, skipped: skipped }))
         return
     }
 
@@ -798,7 +872,7 @@ var tapos_manager_state = {
             ref_block_prefix : 0
         },
         api_pool : [
-            { method: 'https://', host: 'telostestnet.greymass.com',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
+            //{ method: 'https://', host: 'telostestnet.greymass.com',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
             { method: 'https://', host: 'testnet.telos.caleos.io',         valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
             { method: 'https://', host: 'telos-testnet.eosphere.io',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
             { method: 'https://', host: 'telos-testnet.cryptolions.io',    valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
@@ -890,11 +964,15 @@ function tapos_manager_next_run(name, error) {
     return period
 }
 
-/* Kick off */
-for (key in tapos_manager_state) {
-    let state = tapos_manager_state[key]
-    tapos_manager_run(state)
-}
+/* On startup: immediately refresh all APs in parallel, then start the periodic per-chain manager */
+tapos_refresh_all().then(() => {
+    log('Startup AP refresh complete')
+    for (let key in tapos_manager_state) {
+        //tapos_manager_run(tapos_manager_state[key])
+        let manager_state = tapos_manager_state[key]
+        setTimeout(tapos_manager_run, tapos_manager_next_run(manager_state.name), manager_state)
+    }
+})
 
 
 
@@ -917,6 +995,34 @@ function tapos_ap_status_summary() {
     return summary
 }
 
+/* Parse a get_info JSON response, validate the chain hash, update state.tapos and api fields.
+ * Throws on hash mismatch or parse error so callers can handle the failure uniformly.
+ */
+function tapos_process_get_info(json, state, api) {
+    const ref_block_num = json.last_irreversible_block_num & 0xFFFF
+    const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex')
+    const ref_block_prefix = last_irr_block_id.readUInt32LE(8)
+    const hash = json.chain_id
+    if (hash !== state.hash) {
+        throw new Error("chain hash mismatch for '" + api.host + "'")
+    }
+    const acq_time_epoch = Date.now() / 1000 >> 0
+    state.tapos.acq_time_epoch = acq_time_epoch
+    state.tapos.ref_block_num = ref_block_num
+    state.tapos.ref_block_prefix = ref_block_prefix
+    api.version_found = json.server_version_string
+    api.valid = true
+    state.api_last = api
+    /* Record which AP supplied the chain-level TAPOS */
+    state.tapos.source_host = api.host
+    /* Record the TAPOS obtained from this specific AP */
+    api.tapos = {
+        ref_block_num: ref_block_num,
+        ref_block_prefix: ref_block_prefix.toString(16),
+        acq_time_epoch: acq_time_epoch
+    }
+}
+
 /* Check a single AP and update its state. Returns a Promise that always resolves (never rejects). */
 function tapos_check_ap(state, api) {
     return new Promise(resolve => {
@@ -932,21 +1038,7 @@ function tapos_check_ap(state, api) {
             response.on('data', chunk => { info += chunk })
             response.on('end', () => {
                 try {
-                    let json = JSON.parse(info)
-                    const ref_block_num = json.last_irreversible_block_num & 0xFFFF
-                    const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex')
-                    const ref_block_prefix = last_irr_block_id.readUInt32LE(8)
-                    const hash = json.chain_id
-                    if (hash !== state.hash) {
-                        throw new Error("chain hash mismatch for '" + api.host + "'")
-                    }
-                    state.tapos.acq_time_epoch = Date.now() / 1000 >> 0
-                    state.tapos.ref_block_num = ref_block_num
-                    state.tapos.ref_block_prefix = ref_block_prefix
-                    api.version_found = json.server_version_string
-                    api.valid = true
-                    //if (api.errors > 0) api.errors--
-                    state.api_last = api
+                    tapos_process_get_info(JSON.parse(info), state, api)
                     log("tapos_refresh: '" + api.host + "' valid, version=" + api.version_found)
                 } catch (e) {
                     api.valid = false
@@ -1053,25 +1145,11 @@ function tapos_manager_run(state) {
         })
         response.on('end', () => {
             try {
-                let json = JSON.parse(info)
-
                 /* Interestingly, the ref_block_prefix is, converted to hex, embedded in the same
                  * block ID at the 8th byte position in reversed byte order. Which means we can get the
                  * prefix right from the block id in the get_info request without making an additional request to get_block.
                  */
-                const ref_block_num = json.last_irreversible_block_num & 0xFFFF;
-                const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex');
-                const ref_block_prefix = last_irr_block_id.readUInt32LE(8);
-                const hash = json.chain_id
-                if (hash !== state.hash) {
-                    throw new Error("chain hash mismatch for '" + api.host + "', found '" + hash + "', require '" + state.hash + "'")
-                }
-
-                state.tapos.acq_time_epoch = Date.now() / 1000 >> 0
-                state.tapos.ref_block_num = ref_block_num
-                state.tapos.ref_block_prefix = ref_block_prefix
-
-                api.version_found = json.server_version_string
+                tapos_process_get_info(JSON.parse(info), state, api)
 
                 log("Acquired TAPOS at " + (new Date(state.tapos.acq_time_epoch * 1000)).toISOString() + " for '" + state.name + "' from '" + url + "' '" + api.version_found + "' ref_block_num: " + state.tapos.ref_block_num.toString(16) + ' prefix: ' + state.tapos.ref_block_prefix.toString(16))
 
