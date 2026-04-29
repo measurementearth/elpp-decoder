@@ -381,7 +381,7 @@ function manage_dispatch_queues(res) {
             log('checking trx ' + t + ' started=' + trx.started)
             if (!trx.started) {
                 /* Collect all valid APs, pick one at random, then try the rest in order on failure */
-                let valid_aps = state.api_pool.filter(a => a.valid)
+                let valid_aps = state.api_pool.filter(a => a.valid && a.enabled !== false)
                 if (valid_aps.length > 0) {
                     /* Shuffle: pick a random starting index */
                     let start = Math.floor(Math.random() * valid_aps.length)
@@ -635,8 +635,9 @@ const dashboardListener = function (req, res) {
     }
 
     if (reqPath === '/api/tapos_refresh') {
-        /* Immediately check ALL APs across ALL chains in parallel, then return updated ap_status */
+        /* Reload AP config from file, then check ALL APs across ALL chains in parallel */
         log('Dashboard: immediate TAPOS refresh requested for all APs')
+        load_antelope_config()
         tapos_refresh_all().then(() => {
             let summary = tapos_ap_status_summary()
             res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -711,15 +712,16 @@ const dashboardListener = function (req, res) {
         let summary = {}
         for (let c in tapos_manager_state) {
             let state = tapos_manager_state[c]
-            summary[c] = state.api_pool.map(api => ({
-                host: api.host,
-                method: api.method,
-                valid: api.valid,
-                errors: api.errors,
-                use_count: api.use_count,
-                trx_count: api.trx_count,
-                version_found: api.version_found
-            }))
+        summary[c] = state.api_pool.map(api => ({
+            host: api.host,
+            method: api.method,
+            enabled: api.enabled !== false,
+            valid: api.valid,
+            errors: api.errors,
+            use_count: api.use_count,
+            trx_count: api.trx_count,
+            version_found: api.version_found
+        }))
         }
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(summary))
@@ -871,14 +873,7 @@ var tapos_manager_state = {
             ref_block_num: 0,
             ref_block_prefix : 0
         },
-        api_pool : [
-            //{ method: 'https://', host: 'telostestnet.greymass.com',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'testnet.telos.caleos.io',         valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'telos-testnet.eosphere.io',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'telos-testnet.cryptolions.io',    valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'api.testnet.telosunlimited.com',  valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' }
-
-        ],
+        api_pool : [],
         pool_index : 0, /* round-robin index for TAPOS health checks */
         api_last : null, /* last API successfully used to acquire TAPOS */
         dispatch_queue : []
@@ -891,14 +886,7 @@ var tapos_manager_state = {
             ref_block_num: 0,
             ref_block_prefix: 0
         },
-        api_pool: [
-            { method: 'https://', host: 'telos.greymass.com',         valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'telos.caleos.io',            valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'telos.eosphere.io',          valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'telos.eosrio.io',            valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'telos.cryptolions.io',       valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' },
-            { method: 'https://', host: 'api.telosunlimited.com',     valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' }
-        ],
+        api_pool: [],
         pool_index : 0, /* round-robin index for TAPOS health checks */
         api_last : null, /* last API successfully used to acquire TAPOS */
         dispatch_queue : []
@@ -964,11 +952,50 @@ function tapos_manager_next_run(name, error) {
     return period
 }
 
-/* On startup: immediately refresh all APs in parallel, then start the periodic per-chain manager */
+/* Load AP pool definitions from antelope-config.json and merge into tapos_manager_state.
+ * Existing APs (matched by host+method) retain their runtime stats; new APs get fresh defaults;
+ * APs no longer in the file are removed.
+ */
+function load_antelope_config() {
+    const config_path = path.join(__dirname, 'antelope-config.json')
+    let config
+    try {
+        config = JSON.parse(fs.readFileSync(config_path, 'utf8'))
+    } catch (e) {
+        log('load_antelope_config: failed to read ' + config_path + ': ' + (e.message || e))
+        return
+    }
+    for (let chain_key in config) {
+        let state = tapos_manager_state[chain_key]
+        if (!state) {
+            log('load_antelope_config: unknown chain key "' + chain_key + '" in config, skipping')
+            continue
+        }
+        let new_hosts = config[chain_key]
+        let old_pool = state.api_pool
+
+        /* Build updated pool: preserve existing AP objects, add new ones */
+        let updated_pool = new_hosts.map(entry => {
+            let enabled = entry.enabled !== false
+            let existing = old_pool.find(a => a.host === entry.host && a.method === entry.method)
+            if (existing) {
+                existing.enabled = enabled
+                return existing
+            }
+            return { method: entry.method, host: entry.host, enabled: enabled, valid: false, errors: 0, check_count: 0, use_count: 0, trx_count: 0, version_found: '' }
+        })
+
+        let removed = old_pool.filter(a => !new_hosts.some(e => e.host === a.host)).length
+        state.api_pool = updated_pool
+        log('load_antelope_config: ' + chain_key + ' pool updated — ' + updated_pool.length + ' APs (' + removed + ' removed)')
+    }
+}
+
+/* On startup: load config, immediately refresh all APs in parallel, then start the periodic per-chain manager */
+load_antelope_config()
 tapos_refresh_all().then(() => {
     log('Startup AP refresh complete')
     for (let key in tapos_manager_state) {
-        //tapos_manager_run(tapos_manager_state[key])
         let manager_state = tapos_manager_state[key]
         setTimeout(tapos_manager_run, tapos_manager_next_run(manager_state.name), manager_state)
     }
@@ -985,6 +1012,7 @@ function tapos_ap_status_summary() {
         summary[c] = state.api_pool.map(api => ({
             host: api.host,
             method: api.method,
+            enabled: api.enabled !== false,
             valid: api.valid,
             errors: api.errors,
             use_count: api.use_count,
@@ -1001,6 +1029,10 @@ function tapos_ap_status_summary() {
 function tapos_process_get_info(json, state, api) {
     const ref_block_num = json.last_irreversible_block_num & 0xFFFF
     const last_irr_block_id = Buffer.from(json.last_irreversible_block_id, 'hex')
+    /* Interestingly, the ref_block_prefix is, converted to hex, embedded in the same
+        * block ID at the 8th byte position in reversed byte order. Which means we can get the
+        * prefix right from the block id in the get_info request without making an additional request to get_block.
+        */
     const ref_block_prefix = last_irr_block_id.readUInt32LE(8)
     const hash = json.chain_id
     if (hash !== state.hash) {
@@ -1068,7 +1100,9 @@ function tapos_refresh_all() {
     for (let c in tapos_manager_state) {
         let state = tapos_manager_state[c]
         for (let i = 0; i < state.api_pool.length; i++) {
-            promises.push(tapos_check_ap(state, state.api_pool[i]))
+            if (state.api_pool[i].enabled !== false) {
+                promises.push(tapos_check_ap(state, state.api_pool[i]))
+            }
         }
     }
     return Promise.all(promises)
@@ -1086,6 +1120,10 @@ function tapos_manager_select_pool(state) {
     state.pool_index = (index + 1) % pool.length
 
     let api = pool[index]
+    if (api.enabled === false) {
+        log("TAPOS Manager: skipping disabled api '" + api.host + "'")
+        return null
+    }
     api.use_count++
     log("TAPOS Manager: checking api '" + api.host + "' (index " + index + ') uses ' + api.use_count + ' errors ' + api.errors)
     return api
@@ -1145,10 +1183,7 @@ function tapos_manager_run(state) {
         })
         response.on('end', () => {
             try {
-                /* Interestingly, the ref_block_prefix is, converted to hex, embedded in the same
-                 * block ID at the 8th byte position in reversed byte order. Which means we can get the
-                 * prefix right from the block id in the get_info request without making an additional request to get_block.
-                 */
+
                 tapos_process_get_info(JSON.parse(info), state, api)
 
                 log("Acquired TAPOS at " + (new Date(state.tapos.acq_time_epoch * 1000)).toISOString() + " for '" + state.name + "' from '" + url + "' '" + api.version_found + "' ref_block_num: " + state.tapos.ref_block_num.toString(16) + ' prefix: ' + state.tapos.ref_block_prefix.toString(16))

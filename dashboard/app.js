@@ -30,17 +30,23 @@ function renderApStatus(data) {
   for (const chain in data) {
     html += '<div class="chain-header">' + chain + '</div>'
     html += '<table><thead><tr>'
-    html += '<th>Host</th><th>Status</th><th>Errors</th><th>Uses</th><th>Trx Sent</th><th>Version</th>'
+    html += '<th>Host</th><th>Enabled</th><th>Status</th><th>Errors</th><th>Uses</th><th>Trx Sent</th><th>Version</th>'
     html += '</tr></thead><tbody>'
     const aps = data[chain]
     for (const ap of aps) {
-      const badge = ap.valid
-        ? '<span class="badge badge-ok">✓ Valid</span>'
-        : '<span class="badge badge-err">✗ Invalid</span>'
+      const enabledBadge = ap.enabled !== false
+        ? '<span class="badge badge-ok">✓ Enabled</span>'
+        : '<span class="badge badge-warn">✗ Disabled</span>'
+      const statusBadge = ap.enabled === false
+        ? '<span class="badge" style="background:#6b7280;color:#fff">—</span>'
+        : ap.valid
+          ? '<span class="badge badge-ok">✓ Valid</span>'
+          : '<span class="badge badge-err">✗ Invalid</span>'
       const version = ap.version_found || '<span style="color:#aaa">—</span>'
-      html += '<tr>'
+      html += '<tr' + (ap.enabled === false ? ' style="opacity:0.5"' : '') + '>'
       html += '<td><code>' + ap.method + ap.host + '</code></td>'
-      html += '<td>' + badge + '</td>'
+      html += '<td>' + enabledBadge + '</td>'
+      html += '<td>' + statusBadge + '</td>'
       html += '<td>' + ap.errors + '</td>'
       html += '<td>' + ap.use_count + '</td>'
       html += '<td>' + ap.trx_count + '</td>'

@@ -1,0 +1,17 @@
+{
+  "TELOS_TESTNET": [
+    { "method": "https://", "host": "telostestnet.greymass.com",      "enabled": false },
+    { "method": "https://", "host": "testnet.telos.caleos.io",        "enabled": true },
+    { "method": "https://", "host": "telos-testnet.eosphere.io",      "enabled": true },
+    { "method": "https://", "host": "telos-testnet.cryptolions.io",   "enabled": true },
+    { "method": "https://", "host": "api.testnet.telosunlimited.com", "enabled": true }
+  ],
+  "TELOS_MAINNET": [
+    { "method": "https://", "host": "telos.greymass.com",     "enabled": true },
+    { "method": "https://", "host": "telos.caleos.io",        "enabled": true },
+    { "method": "https://", "host": "telos.eosphere.io",      "enabled": true },
+    { "method": "https://", "host": "telos.eosrio.io",        "enabled": true },
+    { "method": "https://", "host": "telos.cryptolions.io",   "enabled": true },
+    { "method": "https://", "host": "api.telosunlimited.com", "enabled": true }
+  ]
+}
