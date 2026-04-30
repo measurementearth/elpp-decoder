@@ -112,8 +112,17 @@ const CHAIN_KEY_FROM_ID = {
 
 Dispatch the tapos response downlink to the device
  */
-function dispatch_tapos(tapos_req, tapos, time_ms, path, res) {
+function dispatch_tapos(state, tapos_req, tapos, time_ms, path, res) {
 
+    state.last_tapos_dispatched = {
+        chain_id: tapos_req.chain_id,
+        req_id: tapos_req.req_id,
+        ref_block_num: tapos.ref_block_num,
+        ref_block_prefix: tapos.ref_block_prefix.toString(16),
+        acq_time_epoch: tapos.acq_time_epoch,
+        source_host: tapos.source_host || null,
+        dispatch_epoch: Date.now() / 1000 >> 0
+    }
 
     function tapos_provider() {
         return [
@@ -198,9 +207,37 @@ function dispatch_tapos(tapos_req, tapos, time_ms, path, res) {
 
 }
 
-function remove_trx(chain_q, chain_q_index) {
-    log("trx for '" + chain_q[chain_q_index].key + "' removed from queue at " + chain_q_index)
-    chain_q.splice(chain_q_index, 1)
+/* Remove the transaction object from the dispatch set */
+function remove_trx(dispatch_set, trx) {
+    if (!dispatch_set) {
+        log('warning: attempted to remove trx from non-existent set')
+    }
+    else if (!dispatch_set.delete(trx)) {
+        log('warning: attempted to remove non-existent trx from set')
+    }
+    else {
+        log("trx removed from set")
+    }
+}
+
+function retry_trx(retry_type_msg, status_code, api, dispatch_set, trx) {
+    if (dispatch_set && trx) {
+        trx.attempts++
+        let attempts = trx.attempts
+        if (attempts >= TRX_MAX_ATTEMPTS) {
+            log('trx ' + retry_type_msg + ' failed (' + status_code + ') via ' + api.host + ', max attempts (' + TRX_MAX_ATTEMPTS + ') reached, dropping')
+            let chain_key = trx.chain_key
+            let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
+            if (cstats) { cstats.trx_dropped_total++; cstats.trx_dropped_other++ }
+            remove_trx(dispatch_set, trx)
+        } else {
+            log('trx ' + retry_type_msg + ' failed (' + status_code + ') via ' + api.host + ', attempt ' + attempts + '/' + TRX_MAX_ATTEMPTS + ', will retry')
+            trx.started = false
+        }
+    }
+    else {
+        log('warning: attempted to retry trx with missing dispatch set or trx')
+    }
 }
 
 /* This can be a result of an API request from the remote platform, in which case
@@ -211,8 +248,11 @@ function remove_trx(chain_q, chain_q_index) {
  * On HTTP 200 success the trx is removed from the queue.
  * On any failure the trx is left in the queue (started=false) so it can be retried.
  * Returns true if the request was initiated (does not mean it succeeded).
+ *
+ * The 'trx' object reference lives in the http request closures and is removed
+ * from the dispatch set as required (success, unrecoverable error, retry limit reached)
  */
-function dispatch_trx(json, api, res, chain_q, chain_q_index) {
+function dispatch_trx(json, api, res, dispatch_set, trx) {
 
     const use_https = api.method === 'https://'
     const transport = use_https ? https : http
@@ -229,8 +269,13 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
         }
     };
 
+    if (!dispatch_set || !trx) {
+        log('warning: no trx to process!')
+        return false
+    }
+
     /* Mark in-flight so manage_dispatch_queues won't re-dispatch while pending */
-    chain_q[chain_q_index].started = true
+    trx.started = true
 
     /* Set up and execute the request */
     var post_req = transport.request(post_options, function (hres) {
@@ -240,7 +285,16 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
             data += chunk
         })
         hres.on('end', () => {
+            /* On success, data is the {"transaction_id":"c43c...","processed":{...}} response
+            This will contain the decoded ABI of transaction data including sensor measurements
+            On failure it contains error codes and descriptive messages */
             log(data)
+            /* Store the result with the device */
+            let state = device_states[trx.key]
+            if (state) {
+                // too verbose state.last_trx_response = data
+            }
+
             if (hres.statusCode >= 200 && hres.statusCode < 300) {
                 log('trx dispatch success (' + hres.statusCode + ') via ' + api.host)
                 if (res) {
@@ -248,7 +302,7 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
                     res.end(data)
                 }
                 /* Only remove on confirmed success */
-                remove_trx(chain_q, chain_q_index)
+                remove_trx(dispatch_set, trx)
             } else {
                 /* Check if the error is unrecoverable — if so, drop the trx immediately */
                 let drop = false
@@ -267,13 +321,13 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
 
                 /* record unable to send as an error associated with the AP, whether dropped or scheduled for retry */
                 api.errors++
-                let _dev1 = chain_q[chain_q_index] && device_states[chain_q[chain_q_index].key]
+                let _dev1 = trx && device_states[trx.key]
                 if (_dev1) _dev1.trx_errors++
 
                 if (drop) {
-                    if (chain_q[chain_q_index]) {
+                    if (trx) {
                         /* Increment unrecoverable drop counters for the correct chain */
-                        let chain_key = chain_q[chain_q_index].chain_key
+                        let chain_key = trx.chain_key
                         let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
                         if (cstats) {
                             cstats.trx_dropped_total++
@@ -284,75 +338,37 @@ function dispatch_trx(json, api, res, chain_q, chain_q_index) {
                                 cstats.unrecoverable_errors[code] = (cstats.unrecoverable_errors[code] || 0) + 1
                             } catch (_) {}
                         }
-                        remove_trx(chain_q, chain_q_index)
+                        remove_trx(dispatch_set, trx)
                     }
                 } else {
-
-                    if (chain_q[chain_q_index]) {
-                        chain_q[chain_q_index].attempts++
-                        let attempts = chain_q[chain_q_index].attempts
-                        if (attempts >= TRX_MAX_ATTEMPTS) {
-                            log('trx dispatch failed (' + hres.statusCode + ') via ' + api.host + ', max attempts (' + TRX_MAX_ATTEMPTS + ') reached, dropping')
-                            let chain_key = chain_q[chain_q_index].chain_key
-                            let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
-                            if (cstats) { cstats.trx_dropped_total++; cstats.trx_dropped_other++ }
-                            remove_trx(chain_q, chain_q_index)
-                        } else {
-                            log('trx dispatch failed (' + hres.statusCode + ') via ' + api.host + ', attempt ' + attempts + '/' + TRX_MAX_ATTEMPTS + ', will retry')
-                            chain_q[chain_q_index].started = false
-                        }
-                    }
+                    retry_trx('dispatch', hres.statusCode, api, dispatch_set, trx)
                 }
             }
         })
         hres.on('error', (err) => {
             api.errors++
-            let _dev2 = chain_q[chain_q_index] && device_states[chain_q[chain_q_index].key]
+            let _dev2 = trx && device_states[trx.key]
             if (_dev2) _dev2.trx_errors++
             log('POST xfer error via ' + api.host + ': ' + err.message)
             if (res) {
                 res.statusCode = 500
                 res.end('POST xfer error: ' + err.message)
             }
-            if (chain_q[chain_q_index]) {
-                chain_q[chain_q_index].attempts++
-                let attempts = chain_q[chain_q_index].attempts
-                if (attempts >= TRX_MAX_ATTEMPTS) {
-                    log('trx xfer error, max attempts (' + TRX_MAX_ATTEMPTS + ') reached, dropping')
-                    let chain_key = chain_q[chain_q_index].chain_key
-                    let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
-                    if (cstats) { cstats.trx_dropped_total++; cstats.trx_dropped_other++ }
-                    remove_trx(chain_q, chain_q_index)
-                } else {
-                    chain_q[chain_q_index].started = false
-                }
-            }
+            retry_trx('xfer', 500, api, dispatch_set, trx)
         })
     })
 
     /* Network-level error: leave trx in queue for retry (up to max attempts) */
     post_req.on('error', (err) => {
         api.errors++
-        let _dev3 = chain_q[chain_q_index] && device_states[chain_q[chain_q_index].key]
+        let _dev3 = trx && device_states[trx.key]
         if (_dev3) _dev3.trx_errors++
         log('POST error via ' + api.host + ': ' + err.message)
         if (res) {
             res.statusCode = 500
             res.end('POST error: ' + err.message)
         }
-        if (chain_q[chain_q_index]) {
-            chain_q[chain_q_index].attempts++
-            let attempts = chain_q[chain_q_index].attempts
-            if (attempts >= TRX_MAX_ATTEMPTS) {
-                log('trx POST error, max attempts (' + TRX_MAX_ATTEMPTS + ') reached, dropping')
-                let chain_key = chain_q[chain_q_index].chain_key
-                let cstats = (chain_key && server_stats[chain_key]) ? server_stats[chain_key] : null
-                if (cstats) { cstats.trx_dropped_total++; cstats.trx_dropped_other++ }
-                remove_trx(chain_q, chain_q_index)
-            } else {
-                chain_q[chain_q_index].started = false
-            }
-        }
+        retry_trx('POST', 500, api, dispatch_set, trx)
     })
 
     log('write request to ' + api.method + api.host + ':')
@@ -374,11 +390,10 @@ function manage_dispatch_queues(res) {
     log('manage dispatch queues')
     for (let c in tapos_manager_state) {
         let state = tapos_manager_state[c]
-        let chain_q = state.dispatch_queue
-        log('checking chain state ' + c + ', queue has ' + chain_q.length + ' items')
-        for (let t = 0; t < chain_q.length; t++) {
-            let trx = chain_q[t]
-            log('checking trx ' + t + ' started=' + trx.started)
+        let dispatch_set = state.dispatch_set
+        log('checking chain state ' + c + ', queue has ' + dispatch_set.size + ' items')
+        for (let trx of dispatch_set) {
+            log('checking trx started=' + trx.started)
             if (!trx.started) {
                 /* Collect all valid APs, pick one at random, then try the rest in order on failure */
                 let valid_aps = state.api_pool.filter(a => a.valid && a.enabled !== false)
@@ -386,9 +401,9 @@ function manage_dispatch_queues(res) {
                     /* Shuffle: pick a random starting index */
                     let start = Math.floor(Math.random() * valid_aps.length)
                     let api = valid_aps[start]
-                    log("dispatching pending trx for '" + trx.key + "' at index " + t + " to '" + api.host + "' (randomly selected from " + valid_aps.length + " valid APs)")
+                    log("dispatching pending trx for '" + trx.key + "' to '" + api.host + "' (randomly selected from " + valid_aps.length + " valid APs)")
                     api.trx_count++
-                    dispatch_trx(trx.json, api, res, chain_q, t)
+                    dispatch_trx(trx.json, api, res, dispatch_set, trx)
                 } else {
                     log('warning: no valid AP available for dispatch')
                 }
@@ -401,21 +416,25 @@ function push_trx(trx, state, res) {
     log('push trx')
 
     if (trx) {
+        let chain_key = CHAIN_KEY_FROM_ID[trx.chain] || null
+        state.chain = chain_key || ''
 
         let epoch = Date.now() / 1000 >> 0
         /* Move it to the dispatcher queue for the chain */
-        let dispatch_queue = dispatch_get(trx.chain)
-        if (dispatch_queue) {
-            let chain_key = CHAIN_KEY_FROM_ID[trx.chain] || null
-            log('posting trx to chain ' + trx.chain + ' (' + chain_key + ') dispatch queue at ' + dispatch_queue.length)
-            dispatch_queue.push({
+        let dispatch_set = dispatch_get(trx.chain)
+        if (dispatch_set) {
+            log('posting trx to chain ' + trx.chain + ' (' + chain_key + ') dispatch set')
+            /* the 'queued' trx object is what is actually stored in the set and referenced for dispatching, retries,
+            and status - it contains metadata like attempts count and started flag, along with the original trx json and device key for reference */
+            let queued_trx = {
                 epoch: epoch,
                 started: false,
                 attempts: 0,          /* number of dispatch attempts made so far */
                 json: trx.json,
                 key: state.key,       /* propagate device key */
                 chain_key: chain_key  /* propagate chain key for per-chain stats */
-            })
+            }
+            dispatch_set.add(queued_trx)
 
             state.trx_count++
         } else {
@@ -482,6 +501,9 @@ function get_device_state(key) {
         state.first_epoch = Date.now() / 1000 >> 0
         state.trx_count = 0
         state.trx_errors = 0
+        state.gateway = {}   /* lat,lon, other metadata provided by the network (not the device) */
+        state.name = ''      /* metadata provided by the network (For Helium, this is the device name in the console) */
+        state.chain = ''     /* TELOS_MAINNET for example, set as it becomes known through uplink messages */
     }
     /* Add a 'last used' epoch for possible garbage collection */
     state.last_epoch = Date.now() / 1000 >> 0
@@ -493,6 +515,27 @@ function get_device_state(key) {
 /* This assigned port is used for Antelope ELPP protocol messages on LORAWAN.
 The channel map associated with this port is fixed on both ends of the link and MUST NOT CHANGE. */
 const ELPP_PORT_EOS_LORAWAN             = 8
+
+function locationFromHelium(state, data) {
+     /* Scan hotspots[], choose first entry, return location object:
+       lat, lon, name
+    */
+    if (!state || !data) {
+        return
+    }
+
+    for (let h in data.hotspots) {
+        const hotspot = data.hotspots[h] || {}
+        if (state.gateway) {
+            state.gateway.lat = hotspot.lat || 0
+            state.gateway.lon = hotspot.long || 0
+            state.gateway.name = hotspot.name || ''
+            state.gateway.rssi = hotspot.rssi || 0
+            state.gateway.snr = hotspot.snr || 0
+        }
+    }
+}
+
 
 function decodeHelium(data, res) {
     log('Decode Helium')
@@ -519,6 +562,8 @@ function decodeHelium(data, res) {
 
     /* Record downlink URL for future forced dispatches (e.g. from dashboard) */
     state.downlink_url = data.downlink_url
+    locationFromHelium(state, data)
+    state.name = data.name || ''
 
     /* Decoder result may have:
      *   trx : {} transaction
@@ -545,16 +590,9 @@ function decodeHelium(data, res) {
             let tapos = tapos_get(dresult.tapos_req.chain_id)
 
             if (tapos) {
-                state.last_tapos_dispatched = {
-                    chain_id: dresult.tapos_req.chain_id,
-                    req_id: dresult.tapos_req.req_id,
-                    ref_block_num: tapos.ref_block_num,
-                    ref_block_prefix: tapos.ref_block_prefix.toString(16),
-                    acq_time_epoch: tapos.acq_time_epoch,
-                    source_host: tapos.source_host || null,
-                    dispatch_epoch: Date.now() / 1000 >> 0
-                }
-                dispatch_tapos(dresult.tapos_req, tapos, gw_rx_time_ms, url.pathname, res)
+                /* set the device state's chain key here, also set by trx */
+                state.chain = CHAIN_KEY_FROM_ID[dresult.tapos_req.chain_id] || ''
+                dispatch_tapos(state, dresult.tapos_req, tapos, gw_rx_time_ms, url.pathname, res)
             } else {
                 res.writeHead(500)
                 let msg = 'decoder error: no tapos'
@@ -597,10 +635,19 @@ const requestListener = function (req, res) {
             try {
                 decodeHelium(JSON.parse(data), res)
             } catch (e) {
-                res.writeHead(500)
+                /* Can throw another exception if already written the header:
+                    Error [ERR_HTTP_HEADERS_SENT]: Cannot write headers after they are sent to the client
+                */
                 let msg = 'Error: ' + ((e && ('message' in e)) ? e.message : 'unknown')
                 log(msg)
-                res.end(msg)
+                if (!res.headersSent) {
+                    res.writeHead(500)
+                    res.end(msg)
+                }
+                else {
+                    /* Headers already sent, can't change status code, just end response */
+                    res.end()
+                }
             }
         })
         return
@@ -686,12 +733,17 @@ const dashboardListener = function (req, res) {
         let skipped = []
         for (let dev_key in device_states) {
             let dev = device_states[dev_key]
-            if (dev.last_tapos_dispatched && dev.last_tapos_dispatched.chain_id === chain_id && dev.downlink_url) {
+            /* 'chain' is the chain key (e.g. 'TELOS_MAINNET') and  is set on any uplink message with the chain_id embedded */
+            if (dev.chain === chain_key && dev.downlink_url) {
                 try {
                     let url = new URL(dev.downlink_url)
                     let tapos_req = { chain_id: chain_id, req_id: 0 }
                     log('Dashboard: force-dispatching TAPOS to device ' + dev_key + ' on chain ' + chain_key)
-                    dispatch_tapos(tapos_req, tapos, 0, url.pathname, null)
+                    /* Note: *must* use time=0 to avoid setting the device's time
+                    since this mechanism is normally used to transfer time to the devices as well
+                    The req_id may or may not match any pending ID, but with time=0 it won't matter
+                    TAPOS gets set regardless */
+                    dispatch_tapos(dev, tapos_req, tapos, 0, url.pathname, null)
                     dispatched.push(dev_key)
                 } catch (e) {
                     log('Dashboard: error dispatching TAPOS to device ' + dev_key + ': ' + e.message)
@@ -818,7 +870,7 @@ const TRX_UNRECOVERABLE_ERROR_CODES = new Set([
     3040004,  // cfa_irrelevant_auth
     3040005,  // expired_tx_exception
     3040006,  // tx_exp_too_far_exception
-    3040007,  // invalid_ref_block_exception
+    //3040007,  // invalid_ref_block_exception // Not necessarily unrecoverable — for testnets in particular, the TAPOS block num and/or ref ID may not exist on the selected AP
     3040008,  // tx_duplicate
     3040009,  // deferred_tx_duplicate
     3040010,  // cfa_inside_generated_tx
@@ -876,7 +928,7 @@ var tapos_manager_state = {
         api_pool : [],
         pool_index : 0, /* round-robin index for TAPOS health checks */
         api_last : null, /* last API successfully used to acquire TAPOS */
-        dispatch_queue : []
+        dispatch_set : new Set() /* Set of pending transactions waiting for dispatch */
     },
     [KEY_TELOS_MAINNET]: {
         name: KEY_TELOS_MAINNET,
@@ -889,7 +941,7 @@ var tapos_manager_state = {
         api_pool: [],
         pool_index : 0, /* round-robin index for TAPOS health checks */
         api_last : null, /* last API successfully used to acquire TAPOS */
-        dispatch_queue : []
+        dispatch_set : new Set()
     }
 }
 
@@ -917,7 +969,7 @@ function dispatch_get(chain_id) {
         if (key in tapos_manager_state) {
             let state = tapos_manager_state[key]
             //log('tapos for ' + state.name)
-            return state.dispatch_queue
+            return state.dispatch_set
         }
     }
     return null
@@ -1000,8 +1052,6 @@ tapos_refresh_all().then(() => {
         setTimeout(tapos_manager_run, tapos_manager_next_run(manager_state.name), manager_state)
     }
 })
-
-
 
 
 /* Build the AP status summary object used by /api/ap_status and /api/tapos_refresh */
